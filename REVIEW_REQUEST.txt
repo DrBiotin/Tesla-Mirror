@@ -1,0 +1,1738 @@
+Kişisel kullanım için yazılmış bir Android uygulamasının (TeslaMirror) ayrıntılı kod incelemesini (code review) istiyorum. Lütfen ÇOKLU AJAN yaklaşımıyla çalış: en az 3 bağımsız uzman inceleyici rolünü ayrı ayrı yürüt — (1) Android platform/yaşam döngüsü/izinler (Android 14–16, MediaProjection, ön plan servisi), (2) medya hattı (MediaCodec H.264/AAC, zaman damgaları, A/V senkron, fMP4/MSE kutu yapısı), (3) ağ sunucusu + tarayıcı oynatıcısı + güvenlik (WebSocket, eşzamanlılık, MSE, Tesla tarayıcısı). Sonra bulguları birleştir, tekrarları ele ve her bulguyu doğrula.
+
+UYGULAMA: Telefon ekranı + dahili sesi, telefonun Wi-Fi hotspot'u üzerinden Tesla'nın yerleşik (Chromium tabanlı) tarayıcısına aktarır. Akış: MediaProjection VirtualDisplay → MediaCodec H.264 (Surface girişi) → Annex-B→AVCC → fragmented MP4 (her moof/mdat'ta 1 örnek); AudioPlaybackCapture (48 kHz stereo) → AudioPacer (jitter tamponu) → AAC-LC → fMP4. Telefonda bağımlılıksız bir HTTP+WebSocket sunucusu (port 8080) çalışır; Tesla sayfası (assets/index.html) ayrı <video> ve <audio> öğelerinde Media Source Extensions ile oynatır, ses ana saat, video onu izler. Hedef: Android 16 (targetSdk 36), minSdk 29. Kod GitHub Actions'ta derleniyor.
+
+ZATEN YAPILANLAR (bunları tekrar bulgu olarak yazma, ama hatalıysa söyle): Saf Java kısımlar (Fmp4, AnnexB, StreamServer, AudioPacer) ve oynatıcı masaüstü Chrome'da ffmpeg akışlarıyla test edildi: ses+görüntü oynuyor, ~0,3 sn gecikme, A/V farkı 5–25 ms, çözünürlük değişimi ve 3 sn durağan ekran sorunsuz; AudioPacer jitter/patlama/±100 ppm saat kayması/sessizlik senaryolarında simüle edildi. Önceki incelemede düzeltilenler: ses çıtırtısı (jitter tamponu), durağan ekranda donma, kilitlenince paylaşımın durması (ekran wake lock), yabancı Origin ve yerel olmayan IP reddi, ping+okuma zaman aşımı, port yeniden kullanım, kaynak sızıntıları. Android'e özel kısımlar henüz gerçek cihazda test EDİLMEDİ.
+
+ÇIKTI BİÇİMİ (Türkçe): Her bulgu için: [Ciddiyet: Kritik/Önemli/Küçük] — dosya:satır — sorun — somut hata senaryosu — önerilen kesin düzeltme (kod parçası ile) — güven düzeyin (Kesin/Muhtemel/Tahmin). Emin olmadığın Android davranışlarını açıkça belirt, uydurma. Sonunda "kontrol edilip sorun bulunmayanlar" listesi ver. Stil önerileri değil, gerçek hatalar ve riskler istiyorum.
+
+Tüm kaynak kodu (satır numaralı) aşağıdadır:
+
+# TeslaMirror – review bundle (all source files)
+
+===== FILE: app/src/main/AndroidManifest.xml =====
+     1	<?xml version="1.0" encoding="utf-8"?>
+     2	<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+     3	
+     4	    <uses-permission android:name="android.permission.INTERNET" />
+     5	    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+     6	    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+     7	    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+     8	    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+     9	    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    10	    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    11	    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    12	
+    13	    <application
+    14	        android:allowBackup="false"
+    15	        android:icon="@android:drawable/ic_menu_upload"
+    16	        android:label="TeslaMirror"
+    17	        android:theme="@android:style/Theme.DeviceDefault">
+    18	
+    19	        <activity
+    20	            android:name=".MainActivity"
+    21	            android:exported="true"
+    22	            android:launchMode="singleTask">
+    23	            <intent-filter>
+    24	                <action android:name="android.intent.action.MAIN" />
+    25	                <category android:name="android.intent.category.LAUNCHER" />
+    26	            </intent-filter>
+    27	        </activity>
+    28	
+    29	        <service
+    30	            android:name=".StreamService"
+    31	            android:exported="false"
+    32	            android:foregroundServiceType="mediaProjection|microphone" />
+    33	    </application>
+    34	</manifest>
+
+===== FILE: app/build.gradle.kts =====
+     1	plugins {
+     2	    id("com.android.application")
+     3	}
+     4	
+     5	android {
+     6	    namespace = "com.apptesla.mirror"
+     7	    compileSdk = 36
+     8	
+     9	    defaultConfig {
+    10	        applicationId = "com.apptesla.mirror"
+    11	        minSdk = 29          // Android 10: internal audio capture
+    12	        targetSdk = 36       // Android 16
+    13	        versionCode = 1
+    14	        versionName = "1.0"
+    15	    }
+    16	
+    17	    buildTypes {
+    18	        release {
+    19	            isMinifyEnabled = false
+    20	            // Personal use: sign release with the debug key so the APK installs directly.
+    21	            signingConfig = signingConfigs.getByName("debug")
+    22	        }
+    23	    }
+    24	
+    25	    compileOptions {
+    26	        sourceCompatibility = JavaVersion.VERSION_17
+    27	        targetCompatibility = JavaVersion.VERSION_17
+    28	    }
+    29	
+    30	    lint {
+    31	        abortOnError = false
+    32	    }
+    33	}
+
+===== FILE: app/src/main/java/com/apptesla/mirror/AnnexB.java =====
+     1	package com.apptesla.mirror;
+     2	
+     3	import java.io.ByteArrayOutputStream;
+     4	import java.util.ArrayList;
+     5	import java.util.List;
+     6	
+     7	/** H.264 Annex-B (start-code) helpers. */
+     8	final class AnnexB {
+     9	    private AnnexB() {}
+    10	
+    11	    static int type(byte[] nal) { return nal.length > 0 ? nal[0] & 0x1F : -1; }
+    12	
+    13	    /** Splits an Annex-B buffer into NAL units without start codes. */
+    14	    static List<byte[]> split(byte[] b, int off, int len) {
+    15	        List<byte[]> out = new ArrayList<>();
+    16	        int end = off + len;
+    17	        int nalStart = -1;
+    18	        int i = off;
+    19	        while (i + 2 < end) {
+    20	            if (b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1) {
+    21	                if (nalStart >= 0) add(out, b, nalStart, i);
+    22	                i += 3;
+    23	                nalStart = i;
+    24	            } else {
+    25	                i++;
+    26	            }
+    27	        }
+    28	        if (nalStart >= 0) add(out, b, nalStart, end);
+    29	        else if (len > 0) add(out, b, off, end); // no start code: treat as one NAL
+    30	        return out;
+    31	    }
+    32	
+    33	    private static void add(List<byte[]> out, byte[] b, int s, int e) {
+    34	        while (e > s && b[e - 1] == 0) e--; // trailing zeros / leading zero of 4-byte start code
+    35	        if (e > s) {
+    36	            byte[] n = new byte[e - s];
+    37	            System.arraycopy(b, s, n, 0, n.length);
+    38	            out.add(n);
+    39	        }
+    40	    }
+    41	
+    42	    /** 4-byte length-prefixed sample; drops SPS(7), PPS(8), AUD(9). */
+    43	    static byte[] toAvcc(List<byte[]> nals) {
+    44	        ByteArrayOutputStream o = new ByteArrayOutputStream();
+    45	        for (byte[] n : nals) {
+    46	            int t = type(n);
+    47	            if (t == 7 || t == 8 || t == 9) continue;
+    48	            int l = n.length;
+    49	            o.write(l >>> 24); o.write(l >>> 16); o.write(l >>> 8); o.write(l);
+    50	            o.write(n, 0, l);
+    51	        }
+    52	        return o.toByteArray();
+    53	    }
+    54	}
+
+===== FILE: app/src/main/java/com/apptesla/mirror/AudioEncoder.java =====
+     1	package com.apptesla.mirror;
+     2	
+     3	import android.annotation.SuppressLint;
+     4	import android.media.AudioAttributes;
+     5	import android.media.AudioFormat;
+     6	import android.media.AudioPlaybackCaptureConfiguration;
+     7	import android.media.AudioRecord;
+     8	import android.media.AudioTimestamp;
+     9	import android.media.MediaCodec;
+    10	import android.media.MediaCodecInfo;
+    11	import android.media.MediaFormat;
+    12	import android.media.projection.MediaProjection;
+    13	import android.util.Log;
+    14	
+    15	import java.nio.ByteBuffer;
+    16	
+    17	/**
+    18	 * Internal audio (AudioPlaybackCapture, Android 10+) -> AAC-LC -> fMP4 fragments.
+    19	 * AudioPacer turns irregular delivery into gap-free, capture-timestamped chunks.
+    20	 */
+    21	final class AudioEncoder {
+    22	    interface Sink {
+    23	        void onAudioInit(byte[] init, String codec);
+    24	        void onAudioFragment(byte[] fragment);
+    25	    }
+    26	
+    27	    private static final String TAG = "TeslaMirror";
+    28	    static final int RATE = 48000, CHANNELS = 2;
+    29	    private static final int FRAME_BYTES = CHANNELS * 2;          // 16-bit stereo
+    30	    private static final int CHUNK = AudioPacer.CHUNK;            // 1024 samples ≈ 21.3 ms
+    31	
+    32	    private final AudioRecord rec;
+    33	    private final MediaCodec codec;
+    34	    private final long t0Us;
+    35	    private final Sink sink;
+    36	    private volatile boolean stop;
+    37	    private Thread inThread, outThread;
+    38	
+    39	    @SuppressLint("MissingPermission") // RECORD_AUDIO checked by caller
+    40	    AudioEncoder(MediaProjection projection, long t0Us, Sink sink) throws Exception {
+    41	        this.t0Us = t0Us;
+    42	        this.sink = sink;
+    43	        AudioPlaybackCaptureConfiguration cfg = new AudioPlaybackCaptureConfiguration.Builder(projection)
+    44	                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+    45	                .addMatchingUsage(AudioAttributes.USAGE_GAME)
+    46	                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+    47	                .build();
+    48	        AudioFormat fmt = new AudioFormat.Builder()
+    49	                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+    50	                .setSampleRate(RATE)
+    51	                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+    52	                .build();
+    53	        int min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
+    54	        rec = new AudioRecord.Builder()
+    55	                .setAudioFormat(fmt)
+    56	                .setBufferSizeInBytes(Math.max(min * 2, CHUNK * 8))
+    57	                .setAudioPlaybackCaptureConfig(cfg)
+    58	                .build();
+    59	        if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
+    60	            rec.release();
+    61	            throw new IllegalStateException("AudioRecord başlatılamadı");
+    62	        }
+    63	        MediaFormat f = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, RATE, CHANNELS);
+    64	        f.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
+    65	        f.setInteger(MediaFormat.KEY_BIT_RATE, 160_000);
+    66	        f.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, CHUNK * 2);
+    67	        MediaCodec c;
+    68	        try {
+    69	            c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
+    70	        } catch (Exception e) {
+    71	            rec.release();
+    72	            throw e;
+    73	        }
+    74	        codec = c;
+    75	        try {
+    76	            codec.configure(f, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+    77	        } catch (Exception e) {
+    78	            codec.release();
+    79	            rec.release();
+    80	            throw e;
+    81	        }
+    82	    }
+    83	
+    84	    void start() {
+    85	        rec.startRecording();
+    86	        codec.start();
+    87	        inThread = new Thread(this::feed, "audio-in");
+    88	        outThread = new Thread(this::drain, "audio-out");
+    89	        inThread.start();
+    90	        outThread.start();
+    91	    }
+    92	
+    93	    void stop() {
+    94	        stop = true;
+    95	        try { if (inThread != null) inThread.join(1000); } catch (InterruptedException ignored) {}
+    96	        try { if (outThread != null) outThread.join(1000); } catch (InterruptedException ignored) {}
+    97	        try { rec.stop(); } catch (Exception ignored) {}
+    98	        rec.release();
+    99	        try { codec.stop(); } catch (Exception ignored) {}
+   100	        try { codec.release(); } catch (Exception ignored) {}
+   101	    }
+   102	
+   103	    private void feed() {
+   104	        AudioTimestamp ts = new AudioTimestamp();
+   105	        final AudioPacer[] self = new AudioPacer[1];
+   106	        // Capture time of a frame from AudioRecord's own timestamp (fallback: estimate from backlog).
+   107	        AudioPacer.Clock clock = (frame, nowNs) -> {
+   108	            if (rec.getTimestamp(ts, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS) {
+   109	                long t = ts.nanoTime + (frame - ts.framePosition) * 1_000_000_000L / RATE;
+   110	                if (Math.abs(t - nowNs) < 1_000_000_000L) return t;
+   111	            }
+   112	            return nowNs - (self[0].readFrames() - frame) * 1_000_000_000L / RATE;
+   113	        };
+   114	        AudioPacer pacer = new AudioPacer(clock, (pcm, off, ptsNs, silent) -> queue(pcm, off, ptsNs / 1000));
+   115	        self[0] = pacer;
+   116	        byte[] buf = new byte[CHUNK * 4];
+   117	        try {
+   118	            while (!stop) {
+   119	                int n = rec.read(buf, 0, Math.min(buf.length, pacer.free()), AudioRecord.READ_NON_BLOCKING);
+   120	                if (n > 0) pacer.append(buf, 0, n);
+   121	                pacer.process(System.nanoTime());
+   122	                if (n <= 0) Thread.sleep(5);
+   123	            }
+   124	        } catch (Exception e) {
+   125	            if (!stop) Log.e(TAG, "audio feed error", e);
+   126	        }
+   127	    }
+   128	
+   129	    private void queue(byte[] pcm, int off, long ptsUs) {
+   130	        int idx = -1;
+   131	        while (!stop && idx < 0) idx = codec.dequeueInputBuffer(20_000);
+   132	        if (idx < 0) return;
+   133	        ByteBuffer ib = codec.getInputBuffer(idx);
+   134	        if (ib == null) return;
+   135	        ib.clear();
+   136	        ib.put(pcm, off, CHUNK);
+   137	        codec.queueInputBuffer(idx, 0, CHUNK, ptsUs, 0);
+   138	    }
+   139	
+   140	    private void drain() {
+   141	        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+   142	        boolean inited = false;
+   143	        long next = -1; // in 48 kHz units
+   144	        int seq = 1;
+   145	        try {
+   146	            while (!stop) {
+   147	                int idx = codec.dequeueOutputBuffer(info, 10_000);
+   148	                if (idx < 0) continue;
+   149	                ByteBuffer bb = codec.getOutputBuffer(idx);
+   150	                byte[] data = new byte[info.size];
+   151	                if (bb != null && info.size > 0) {
+   152	                    bb.position(info.offset);
+   153	                    bb.limit(info.offset + info.size);
+   154	                    bb.get(data);
+   155	                }
+   156	                int flags = info.flags;
+   157	                long pts = info.presentationTimeUs;
+   158	                codec.releaseOutputBuffer(idx, false);
+   159	                if ((flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
+   160	                if (data.length == 0) continue;
+   161	                if ((flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+   162	                    sink.onAudioInit(Fmp4.audioInit(data, RATE, CHANNELS), "mp4a.40.2");
+   163	                    inited = true;
+   164	                    continue;
+   165	                }
+   166	                if (!inited) continue;
+   167	                long t = Math.max(0, (pts - t0Us) * RATE / 1_000_000);
+   168	                if (next < 0 || Math.abs(t - next) > RATE / 10) next = t; // resync if >100 ms off
+   169	                sink.onAudioFragment(Fmp4.fragment(seq++, next, 1024, data, Fmp4.FLAGS_SYNC));
+   170	                next += 1024;
+   171	            }
+   172	        } catch (Exception e) {
+   173	            if (!stop) Log.e(TAG, "audio drain error", e);
+   174	        }
+   175	    }
+   176	}
+
+===== FILE: app/src/main/java/com/apptesla/mirror/AudioPacer.java =====
+     1	package com.apptesla.mirror;
+     2	
+     3	/**
+     4	 * Turns irregular PCM delivery into a gap-free sequence of 1024-sample chunks with
+     5	 * capture-time timestamps (System.nanoTime base).
+     6	 *  - Normal jitter: chunks are emitted only when full, so no silence is ever inserted
+     7	 *    into continuous audio.
+     8	 *  - Real silence (no data arriving): silent chunks keep the timeline near real time,
+     9	 *    so the browser's audio track never stalls.
+    10	 *  - Data older than the timeline (late burst after silence fill) is dropped; a timeline
+    11	 *    behind the capture clock is filled with silence. This bounds latency and drift.
+    12	 * Pure Java (no Android APIs) so it can be unit-tested off-device.
+    13	 */
+    14	final class AudioPacer {
+    15	    interface Clock { long captureNs(long frameIndex, long nowNs); }
+    16	    interface Out { void emit(byte[] pcm, int off, long ptsNs, boolean silence); }
+    17	
+    18	    static final int RATE = 48000, FRAME_BYTES = 4;              // 16-bit stereo
+    19	    static final int CHUNK = 1024 * FRAME_BYTES;
+    20	    static final long CHUNK_NS = 1024L * 1_000_000_000L / RATE;  // 21.333 ms
+    21	    static final long RESYNC_NS = 60_000_000L;
+    22	    static final long SILENCE_AFTER_NS = 150_000_000L;
+    23	    static final long MAX_FILL_NS = 1_000_000_000L;
+    24	
+    25	    private final byte[] acc = new byte[CHUNK * 16];
+    26	    private final byte[] silence = new byte[CHUNK];
+    27	    private int accLen;
+    28	    private long readFrames;
+    29	    private long tNs = Long.MIN_VALUE;
+    30	    private final Clock clock;
+    31	    private final Out out;
+    32	
+    33	    AudioPacer(Clock clock, Out out) { this.clock = clock; this.out = out; }
+    34	
+    35	    long readFrames() { return readFrames; }
+    36	    int backlogFrames() { return accLen / FRAME_BYTES; }
+    37	    int free() { return acc.length - accLen; }
+    38	
+    39	    void append(byte[] b, int off, int n) {
+    40	        n -= n % FRAME_BYTES;
+    41	        if (n <= 0) return;
+    42	        if (n > acc.length) { off += n - acc.length; readFrames += (n - acc.length) / FRAME_BYTES; n = acc.length; }
+    43	        if (accLen + n > acc.length) drop(accLen + n - acc.length);
+    44	        System.arraycopy(b, off, acc, accLen, n);
+    45	        accLen += n;
+    46	        readFrames += n / FRAME_BYTES;
+    47	    }
+    48	
+    49	    void process(long nowNs) {
+    50	        while (true) {
+    51	            if (accLen >= CHUNK) {
+    52	                long head = readFrames - accLen / FRAME_BYTES;
+    53	                long cap = clock.captureNs(head, nowNs);
+    54	                if (tNs == Long.MIN_VALUE) tNs = cap;
+    55	                long d = cap - tNs;
+    56	                if (d > RESYNC_NS) {
+    57	                    if (d > MAX_FILL_NS) tNs = cap;
+    58	                    else { emit(silence, 0, true); continue; }
+    59	                } else if (d < -RESYNC_NS) {
+    60	                    drop(CHUNK);
+    61	                    continue;
+    62	                }
+    63	                emit(acc, 0, false);
+    64	                drop(CHUNK);
+    65	            } else {
+    66	                if (tNs != Long.MIN_VALUE && nowNs - tNs > SILENCE_AFTER_NS) { emit(silence, 0, true); continue; }
+    67	                return;
+    68	            }
+    69	        }
+    70	    }
+    71	
+    72	    private void emit(byte[] b, int off, boolean isSilence) {
+    73	        out.emit(b, off, tNs, isSilence);
+    74	        tNs += CHUNK_NS;
+    75	    }
+    76	
+    77	    private void drop(int bytes) {
+    78	        bytes = Math.min(bytes, accLen);
+    79	        System.arraycopy(acc, bytes, acc, 0, accLen - bytes);
+    80	        accLen -= bytes;
+    81	    }
+    82	}
+
+===== FILE: app/src/main/java/com/apptesla/mirror/Fmp4.java =====
+     1	package com.apptesla.mirror;
+     2	
+     3	import java.io.ByteArrayOutputStream;
+     4	import java.nio.ByteBuffer;
+     5	import java.nio.charset.StandardCharsets;
+     6	
+     7	/**
+     8	 * Minimal fragmented-MP4 (ISO BMFF) writer for Media Source Extensions.
+     9	 * One track per init segment, one sample per fragment (lowest latency).
+    10	 */
+    11	final class Fmp4 {
+    12	    static final int TRACK_ID = 1;
+    13	    static final int VIDEO_TIMESCALE = 90000;
+    14	    static final int FLAGS_SYNC = 0x02000000;      // sample_depends_on = 2 (I-frame)
+    15	    static final int FLAGS_NON_SYNC = 0x01010000;  // depends_on = 1, is_non_sync_sample = 1
+    16	
+    17	    private Fmp4() {}
+    18	
+    19	    // ---------- byte helpers ----------
+    20	    static final class W {
+    21	        final ByteArrayOutputStream o = new ByteArrayOutputStream();
+    22	        W u8(int v) { o.write(v & 0xFF); return this; }
+    23	        W u16(int v) { u8(v >>> 8); u8(v); return this; }
+    24	        W u24(int v) { u8(v >>> 16); u8(v >>> 8); u8(v); return this; }
+    25	        W u32(long v) { u8((int) (v >>> 24)); u8((int) (v >>> 16)); u8((int) (v >>> 8)); u8((int) v); return this; }
+    26	        W u64(long v) { u32(v >>> 32); u32(v & 0xFFFFFFFFL); return this; }
+    27	        W zeros(int n) { for (int i = 0; i < n; i++) o.write(0); return this; }
+    28	        W str(String s) { byte[] b = s.getBytes(StandardCharsets.US_ASCII); o.write(b, 0, b.length); return this; }
+    29	        W bytes(byte[] b) { o.write(b, 0, b.length); return this; }
+    30	        W bytes(byte[] b, int off, int len) { o.write(b, off, len); return this; }
+    31	        byte[] get() { return o.toByteArray(); }
+    32	    }
+    33	
+    34	    static byte[] concat(byte[]... parts) {
+    35	        int n = 0;
+    36	        for (byte[] p : parts) n += p.length;
+    37	        byte[] r = new byte[n];
+    38	        int off = 0;
+    39	        for (byte[] p : parts) { System.arraycopy(p, 0, r, off, p.length); off += p.length; }
+    40	        return r;
+    41	    }
+    42	
+    43	    static byte[] box(String type, byte[]... payload) {
+    44	        byte[] body = concat(payload);
+    45	        return new W().u32(8 + body.length).str(type).bytes(body).get();
+    46	    }
+    47	
+    48	    static byte[] fullBox(String type, int version, int flags, byte[]... payload) {
+    49	        byte[] head = new W().u8(version).u24(flags).get();
+    50	        byte[][] all = new byte[payload.length + 1][];
+    51	        all[0] = head;
+    52	        System.arraycopy(payload, 0, all, 1, payload.length);
+    53	        return box(type, all);
+    54	    }
+    55	
+    56	    private static W matrix(W w) {
+    57	        return w.u32(0x00010000).u32(0).u32(0).u32(0).u32(0x00010000).u32(0).u32(0).u32(0).u32(0x40000000);
+    58	    }
+    59	
+    60	    private static byte[] ftyp() {
+    61	        return box("ftyp", new W().str("iso5").u32(512).str("iso5").str("iso6").str("mp41").get());
+    62	    }
+    63	
+    64	    private static byte[] moov(int timescale, boolean video, int width, int height, byte[] sampleEntry) {
+    65	        byte[] mvhd = fullBox("mvhd", 0, 0, matrix(new W().u32(0).u32(0).u32(1000).u32(0)
+    66	                .u32(0x00010000).u16(0x0100).zeros(10)).zeros(24).u32(TRACK_ID + 1).get());
+    67	        byte[] tkhd = fullBox("tkhd", 0, 3, matrix(new W().u32(0).u32(0).u32(TRACK_ID).u32(0).u32(0)
+    68	                .zeros(8).u16(0).u16(0).u16(video ? 0 : 0x0100).u16(0))
+    69	                .u32((long) width << 16).u32((long) height << 16).get());
+    70	        byte[] mdhd = fullBox("mdhd", 0, 0, new W().u32(0).u32(0).u32(timescale).u32(0).u16(0x55C4).u16(0).get());
+    71	        byte[] hdlr = fullBox("hdlr", 0, 0, new W().u32(0).str(video ? "vide" : "soun").zeros(12)
+    72	                .str(video ? "VideoHandler" : "SoundHandler").u8(0).get());
+    73	        byte[] xmhd = video ? fullBox("vmhd", 0, 1, new W().zeros(8).get())
+    74	                            : fullBox("smhd", 0, 0, new W().zeros(4).get());
+    75	        byte[] dinf = box("dinf", fullBox("dref", 0, 0, new W().u32(1).get(), fullBox("url ", 0, 1)));
+    76	        byte[] stbl = box("stbl",
+    77	                fullBox("stsd", 0, 0, new W().u32(1).get(), sampleEntry),
+    78	                fullBox("stts", 0, 0, new W().u32(0).get()),
+    79	                fullBox("stsc", 0, 0, new W().u32(0).get()),
+    80	                fullBox("stsz", 0, 0, new W().u32(0).u32(0).get()),
+    81	                fullBox("stco", 0, 0, new W().u32(0).get()));
+    82	        byte[] minf = box("minf", xmhd, dinf, stbl);
+    83	        byte[] mdia = box("mdia", mdhd, hdlr, minf);
+    84	        byte[] trak = box("trak", tkhd, mdia);
+    85	        byte[] mvex = box("mvex", fullBox("trex", 0, 0, new W().u32(TRACK_ID).u32(1).u32(0).u32(0).u32(0).get()));
+    86	        return box("moov", mvhd, trak, mvex);
+    87	    }
+    88	
+    89	    /** sps/pps: raw NAL units (no start code, NAL header byte included). */
+    90	    static byte[] videoInit(byte[] sps, byte[] pps, int width, int height) {
+    91	        int profile = sps[1] & 0xFF;
+    92	        W c = new W().u8(1).u8(profile).u8(sps[2] & 0xFF).u8(sps[3] & 0xFF)
+    93	                .u8(0xFF)            // lengthSizeMinusOne = 3
+    94	                .u8(0xE1).u16(sps.length).bytes(sps)
+    95	                .u8(1).u16(pps.length).bytes(pps);
+    96	        if (profile == 100 || profile == 110 || profile == 122 || profile == 144) {
+    97	            // High profiles: 4:2:0, 8-bit (Android hardware AVC encoders), no SPS-ext.
+    98	            c.u8(0xFC | 1).u8(0xF8).u8(0xF8).u8(0);
+    99	        }
+   100	        byte[] avcC = box("avcC", c.get());
+   101	        byte[] avc1 = box("avc1", new W().zeros(6).u16(1).u16(0).u16(0).zeros(12)
+   102	                .u16(width).u16(height).u32(0x00480000).u32(0x00480000).u32(0).u16(1)
+   103	                .zeros(32).u16(0x18).u16(0xFFFF).get(), avcC);
+   104	        return concat(ftyp(), moov(VIDEO_TIMESCALE, true, width, height, avc1));
+   105	    }
+   106	
+   107	    static String videoCodec(byte[] sps) {
+   108	        return String.format("avc1.%02x%02x%02x", sps[1] & 0xFF, sps[2] & 0xFF, sps[3] & 0xFF);
+   109	    }
+   110	
+   111	    private static byte[] desc(int tag, byte[] payload) {
+   112	        W w = new W().u8(tag);
+   113	        int n = payload.length;
+   114	        // 4-byte expandable length (always valid)
+   115	        w.u8(0x80 | ((n >>> 21) & 0x7F)).u8(0x80 | ((n >>> 14) & 0x7F)).u8(0x80 | ((n >>> 7) & 0x7F)).u8(n & 0x7F);
+   116	        return w.bytes(payload).get();
+   117	    }
+   118	
+   119	    /** asc: AudioSpecificConfig (MediaCodec CODEC_CONFIG output / csd-0). */
+   120	    static byte[] audioInit(byte[] asc, int sampleRate, int channels) {
+   121	        byte[] dsi = desc(0x05, asc);
+   122	        byte[] dcd = desc(0x04, concat(new W().u8(0x40).u8(0x15).u24(0).u32(0).u32(0).get(), dsi));
+   123	        byte[] sl = desc(0x06, new byte[]{0x02});
+   124	        byte[] es = desc(0x03, concat(new W().u16(TRACK_ID).u8(0).get(), dcd, sl));
+   125	        byte[] esds = fullBox("esds", 0, 0, es);
+   126	        byte[] mp4a = box("mp4a", new W().zeros(6).u16(1).zeros(8).u16(channels).u16(16).u16(0).u16(0)
+   127	                .u32((long) sampleRate << 16).get(), esds);
+   128	        return concat(ftyp(), moov(sampleRate, false, 0, 0, mp4a));
+   129	    }
+   130	
+   131	    /** One moof+mdat holding a single sample. */
+   132	    static byte[] fragment(int seq, long baseDecodeTime, int duration, byte[] sample, int sampleFlags) {
+   133	        byte[] mfhd = fullBox("mfhd", 0, 0, new W().u32(seq).get());
+   134	        byte[] tfhd = fullBox("tfhd", 0, 0x020000, new W().u32(TRACK_ID).get()); // default-base-is-moof
+   135	        byte[] tfdt = fullBox("tfdt", 1, 0, new W().u64(baseDecodeTime).get());
+   136	        byte[] trun = fullBox("trun", 0, 0x000701, new W().u32(1).u32(0)
+   137	                .u32(duration).u32(sample.length).u32(sampleFlags).get());
+   138	        byte[] moof = box("moof", mfhd, box("traf", tfhd, tfdt, trun));
+   139	        // trun is the last box: [... count(4) data_offset(4) dur(4) size(4) flags(4)]
+   140	        ByteBuffer.wrap(moof).putInt(moof.length - 16, moof.length + 8);
+   141	        byte[] mdatHead = new W().u32(8 + sample.length).str("mdat").get();
+   142	        return concat(moof, mdatHead, sample);
+   143	    }
+   144	}
+
+===== FILE: app/src/main/java/com/apptesla/mirror/MainActivity.java =====
+     1	package com.apptesla.mirror;
+     2	
+     3	import android.Manifest;
+     4	import android.app.Activity;
+     5	import android.content.Intent;
+     6	import android.content.pm.PackageManager;
+     7	import android.graphics.Color;
+     8	import android.graphics.Typeface;
+     9	import android.media.projection.MediaProjectionConfig;
+    10	import android.media.projection.MediaProjectionManager;
+    11	import android.os.Build;
+    12	import android.os.Bundle;
+    13	import android.view.Gravity;
+    14	import android.view.ViewGroup;
+    15	import android.widget.Button;
+    16	import android.widget.LinearLayout;
+    17	import android.widget.ScrollView;
+    18	import android.view.WindowInsets;
+    19	import android.widget.TextView;
+    20	import android.widget.Toast;
+    21	
+    22	import java.net.Inet4Address;
+    23	import java.net.InetAddress;
+    24	import java.net.NetworkInterface;
+    25	import java.util.ArrayList;
+    26	import java.util.Collections;
+    27	import java.util.List;
+    28	
+    29	public class MainActivity extends Activity {
+    30	    private static final int REQ_PERMS = 1, REQ_CAPTURE = 2;
+    31	    private TextView info;
+    32	    private Button button;
+    33	
+    34	    @Override
+    35	    protected void onCreate(Bundle b) {
+    36	        super.onCreate(b);
+    37	        LinearLayout root = new LinearLayout(this);
+    38	        root.setOrientation(LinearLayout.VERTICAL);
+    39	        root.setGravity(Gravity.CENTER_HORIZONTAL);
+    40	        root.setBackgroundColor(Color.rgb(18, 18, 18));
+    41	        int pad = dp(24);
+    42	        root.setPadding(pad, pad, pad, pad);
+    43	
+    44	        TextView title = new TextView(this);
+    45	        title.setText("TeslaMirror");
+    46	        title.setTextSize(30);
+    47	        title.setTypeface(Typeface.DEFAULT_BOLD);
+    48	        title.setTextColor(Color.WHITE);
+    49	        root.addView(title);
+    50	
+    51	        button = new Button(this);
+    52	        button.setTextSize(20);
+    53	        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64));
+    54	        lp.topMargin = dp(28);
+    55	        root.addView(button, lp);
+    56	        button.setOnClickListener(v -> {
+    57	            if (StreamService.running) {
+    58	                startService(new Intent(this, StreamService.class).setAction(StreamService.ACTION_STOP));
+    59	            } else {
+    60	                requestPermsThenCapture();
+    61	            }
+    62	        });
+    63	
+    64	        info = new TextView(this);
+    65	        info.setTextSize(17);
+    66	        info.setTextColor(Color.rgb(220, 220, 220));
+    67	        info.setLineSpacing(0, 1.2f);
+    68	        LinearLayout.LayoutParams ip = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+    69	        ip.topMargin = dp(24);
+    70	        root.addView(info, ip);
+    71	
+    72	        // targetSdk 35+ is edge-to-edge: pad by system bars/cutout and allow scrolling.
+    73	        ScrollView scroll = new ScrollView(this);
+    74	        scroll.setBackgroundColor(Color.rgb(18, 18, 18));
+    75	        scroll.setFillViewport(true);
+    76	        scroll.addView(root);
+    77	        scroll.setOnApplyWindowInsetsListener((view, insets) -> {
+    78	            if (Build.VERSION.SDK_INT >= 30) {
+    79	                android.graphics.Insets i = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+    80	                view.setPadding(i.left, i.top, i.right, i.bottom);
+    81	            }
+    82	            return insets;
+    83	        });
+    84	        setContentView(scroll);
+    85	    }
+    86	
+    87	    @Override
+    88	    protected void onResume() {
+    89	        super.onResume();
+    90	        StreamService.listener = () -> runOnUiThread(this::refresh);
+    91	        refresh();
+    92	    }
+    93	
+    94	    @Override
+    95	    protected void onPause() {
+    96	        StreamService.listener = null;
+    97	        super.onPause();
+    98	    }
+    99	
+   100	    private void refresh() {
+   101	        boolean on = StreamService.running;
+   102	        button.setText(on ? "■  Yayını durdur" : "▶  Yayını başlat");
+   103	        StringBuilder s = new StringBuilder();
+   104	        if (StreamService.lastError != null) s.append("⚠ ").append(StreamService.lastError).append("\n\n");
+   105	        if (on) {
+   106	            s.append("Tesla tarayıcısında şu adreslerden birini açın:\n\n");
+   107	            List<String> ips = ipv4();
+   108	            if (ips.isEmpty()) s.append("(Ağ adresi bulunamadı — hotspot açık mı?)\n");
+   109	            for (String ip : ips) {
+   110	                String[] p = ip.split(" ");
+   111	                s.append("http://").append(p[0]).append(':').append(StreamService.PORT)
+   112	                 .append("   (").append(p[1]).append(")\n");
+   113	            }
+   114	            s.append("\nGenelde hotspot adresi 192.168.x.x veya 10.x.x.x ile başlar.");
+   115	        } else {
+   116	            s.append("1. Telefonda Wi-Fi hotspot'u açın.\n")
+   117	             .append("2. Tesla'yı bu hotspot'a bağlayın (Kontroller > Wi-Fi).\n")
+   118	             .append("3. \"Yayını başlat\"a basın, \"Tüm ekran\"ı seçin.\n")
+   119	             .append("4. Görünen adresi Tesla tarayıcısında açıp ▶ Başlat'a dokunun.\n\n")
+   120	             .append("Notlar:\n• Yayın sırasında telefon ekranı açık tutulur; telefonu kilitlerseniz yayın durur.\n")
+   121	             .append("• Netflix gibi korumalı (DRM) uygulamalar siyah ekran/sessiz görünür.\n")
+   122	             .append("• Tesla sürüşte tarayıcı videosunu gizleyebilir; ses devam eder.");
+   123	        }
+   124	        info.setText(s.toString());
+   125	    }
+   126	
+   127	    private void requestPermsThenCapture() {
+   128	        List<String> need = new ArrayList<>();
+   129	        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+   130	            need.add(Manifest.permission.RECORD_AUDIO);
+   131	        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+   132	            need.add(Manifest.permission.POST_NOTIFICATIONS);
+   133	        if (need.isEmpty()) launchCapture();
+   134	        else requestPermissions(need.toArray(new String[0]), REQ_PERMS);
+   135	    }
+   136	
+   137	    @Override
+   138	    public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+   139	        super.onRequestPermissionsResult(code, perms, results);
+   140	        if (code != REQ_PERMS) return;
+   141	        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+   142	            Toast.makeText(this, "Ses izni verilmedi: yalnızca görüntü aktarılacak", Toast.LENGTH_LONG).show();
+   143	        launchCapture();
+   144	    }
+   145	
+   146	    private void launchCapture() {
+   147	        MediaProjectionManager mpm = getSystemService(MediaProjectionManager.class);
+   148	        Intent i = Build.VERSION.SDK_INT >= 34
+   149	                ? mpm.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+   150	                : mpm.createScreenCaptureIntent();
+   151	        startActivityForResult(i, REQ_CAPTURE);
+   152	    }
+   153	
+   154	    @Override
+   155	    protected void onActivityResult(int req, int result, Intent data) {
+   156	        super.onActivityResult(req, result, data);
+   157	        if (req != REQ_CAPTURE) return;
+   158	        if (result != RESULT_OK || data == null) {
+   159	            Toast.makeText(this, "Ekran yakalama izni verilmedi", Toast.LENGTH_SHORT).show();
+   160	            return;
+   161	        }
+   162	        Intent s = new Intent(this, StreamService.class)
+   163	                .putExtra(StreamService.EXTRA_CODE, result)
+   164	                .putExtra(StreamService.EXTRA_DATA, data);
+   165	        startForegroundService(s);
+   166	    }
+   167	
+   168	    private static List<String> ipv4() {
+   169	        List<String> r = new ArrayList<>();
+   170	        try {
+   171	            for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+   172	                if (!ni.isUp() || ni.isLoopback()) continue;
+   173	                for (InetAddress a : Collections.list(ni.getInetAddresses())) {
+   174	                    if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
+   175	                        String n = ni.getName();
+   176	                        boolean hotspot = n.startsWith("swlan") || n.startsWith("ap") || n.startsWith("softap") || n.equals("wlan1");
+   177	                        String entry = a.getHostAddress() + " " + n + (hotspot ? "·hotspot" : "");
+   178	                        if (hotspot) r.add(0, entry); else r.add(entry);
+   179	                    }
+   180	                }
+   181	            }
+   182	        } catch (Exception ignored) {}
+   183	        return r;
+   184	    }
+   185	
+   186	    private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
+   187	}
+
+===== FILE: app/src/main/java/com/apptesla/mirror/StreamServer.java =====
+     1	package com.apptesla.mirror;
+     2	
+     3	import java.io.ByteArrayOutputStream;
+     4	import java.io.IOException;
+     5	import java.io.InputStream;
+     6	import java.io.OutputStream;
+     7	import java.net.Inet6Address;
+     8	import java.net.InetAddress;
+     9	import java.net.InetSocketAddress;
+    10	import java.net.ServerSocket;
+    11	import java.net.Socket;
+    12	import java.nio.charset.StandardCharsets;
+    13	import java.security.MessageDigest;
+    14	import java.util.Base64;
+    15	import java.util.HashMap;
+    16	import java.util.Locale;
+    17	import java.util.Map;
+    18	import java.util.concurrent.CopyOnWriteArrayList;
+    19	import java.util.concurrent.LinkedBlockingQueue;
+    20	import java.util.concurrent.TimeUnit;
+    21	
+    22	/**
+    23	 * Tiny dependency-free HTTP + WebSocket server.
+    24	 * GET /    -> player page
+    25	 * GET /ws  -> WebSocket; text = JSON config, binary = [type byte][payload]
+    26	 *            type 1 video init, 2 video fragment, 3 audio init, 4 audio fragment
+    27	 */
+    28	final class StreamServer {
+    29	    interface KeyFrameRequester { void requestKeyFrame(); }
+    30	
+    31	    static final byte T_VIDEO_INIT = 1, T_VIDEO = 2, T_AUDIO_INIT = 3, T_AUDIO = 4;
+    32	    private static final int QUEUE_LIMIT = 240;
+    33	    private static final byte[] PING = frame(0x9, new byte[0]);
+    34	
+    35	    private final int port;
+    36	    private final byte[] page;
+    37	    private final KeyFrameRequester keyReq;
+    38	    private final CopyOnWriteArrayList<Client> clients = new CopyOnWriteArrayList<>();
+    39	    private volatile ServerSocket server;
+    40	    private volatile boolean running;
+    41	
+    42	    // Current stream state (guarded by this)
+    43	    private String videoCodec, audioCodec;
+    44	    private byte[] videoInitFrame, audioInitFrame;
+    45	    private boolean audioExpected = true;
+    46	
+    47	    StreamServer(int port, byte[] page, KeyFrameRequester keyReq) {
+    48	        this.port = port;
+    49	        this.page = page;
+    50	        this.keyReq = keyReq;
+    51	    }
+    52	
+    53	    void start() throws IOException {
+    54	        ServerSocket ss = new ServerSocket();
+    55	        ss.setReuseAddress(true);
+    56	        IOException last = null;
+    57	        for (int i = 0; i < 10; i++) {          // previous session may still be releasing the port
+    58	            try { ss.bind(new InetSocketAddress(port)); last = null; break; }
+    59	            catch (IOException e) { last = e; try { Thread.sleep(300); } catch (InterruptedException ignored) {} }
+    60	        }
+    61	        if (last != null) { ss.close(); throw last; }
+    62	        server = ss;
+    63	        running = true;
+    64	        Thread t = new Thread(this::acceptLoop, "ws-accept");
+    65	        t.setDaemon(true);
+    66	        t.start();
+    67	    }
+    68	
+    69	    void stop() {
+    70	        running = false;
+    71	        try { if (server != null) server.close(); } catch (IOException ignored) {}
+    72	        for (Client c : clients) c.close();
+    73	        clients.clear();
+    74	    }
+    75	
+    76	    int clientCount() { return clients.size(); }
+    77	
+    78	    // ---------------- stream state ----------------
+    79	
+    80	    /** Call with false if audio capture is unavailable, so clients don't wait for it. */
+    81	    synchronized void setAudioExpected(boolean expected) {
+    82	        audioExpected = expected;
+    83	        if (!expected) { audioCodec = null; audioInitFrame = null; }
+    84	        broadcastConfig();
+    85	    }
+    86	
+    87	    synchronized void setVideoInit(byte[] init, String codec) {
+    88	        videoCodec = codec;
+    89	        videoInitFrame = frame(0x2, typed(T_VIDEO_INIT, init));
+    90	        broadcastConfig();
+    91	    }
+    92	
+    93	    synchronized void setAudioInit(byte[] init, String codec) {
+    94	        audioCodec = codec;
+    95	        audioInitFrame = frame(0x2, typed(T_AUDIO_INIT, init));
+    96	        broadcastConfig();
+    97	    }
+    98	
+    99	    synchronized void sendVideo(byte[] fragment, boolean key) {
+   100	        if (clients.isEmpty() || videoInitFrame == null) return;
+   101	        byte[] f = frame(0x2, typed(T_VIDEO, fragment));
+   102	        for (Client c : clients) {
+   103	            if (!c.configured) continue;
+   104	            if (c.waitKey) { if (!key) continue; c.waitKey = false; }
+   105	            if (!c.offer(f)) recover(c);
+   106	        }
+   107	    }
+   108	
+   109	    synchronized void sendAudio(byte[] fragment) {
+   110	        if (clients.isEmpty() || audioInitFrame == null) return;
+   111	        byte[] f = frame(0x2, typed(T_AUDIO, fragment));
+   112	        for (Client c : clients) {
+   113	            if (!c.configured || c.waitKey) continue; // start audio together with first video keyframe
+   114	            if (!c.offer(f)) recover(c);
+   115	        }
+   116	    }
+   117	
+   118	    private boolean ready() {
+   119	        return videoInitFrame != null && (!audioExpected || audioInitFrame != null);
+   120	    }
+   121	
+   122	    /** (Re)sends config + init segments; client rebuilds its MediaSource. */
+   123	    private void broadcastConfig() {
+   124	        if (!ready()) return;
+   125	        for (Client c : clients) configure(c);
+   126	        keyReq.requestKeyFrame();
+   127	    }
+   128	
+   129	    private void configure(Client c) {
+   130	        c.queue.clear();
+   131	        String json = "{\"type\":\"config\",\"v\":\"" + videoCodec + "\",\"a\":"
+   132	                + (audioInitFrame != null ? "\"" + audioCodec + "\"" : "null") + "}";
+   133	        c.queue.offer(frame(0x1, json.getBytes(StandardCharsets.UTF_8)));
+   134	        c.queue.offer(videoInitFrame);
+   135	        if (audioInitFrame != null) c.queue.offer(audioInitFrame);
+   136	        c.waitKey = true;
+   137	        c.configured = true;
+   138	    }
+   139	
+   140	    /** Slow client: drop backlog, restart from next keyframe. */
+   141	    private void recover(Client c) {
+   142	        long now = System.currentTimeMillis();
+   143	        if (now - c.lastRecoverMs < 5000) { c.close(); return; } // persistently stuck viewer
+   144	        c.lastRecoverMs = now;
+   145	        configure(c);
+   146	        keyReq.requestKeyFrame();
+   147	    }
+   148	
+   149	    private synchronized void join(Client c) {
+   150	        if (!running) { c.close(); return; }
+   151	        clients.add(c);
+   152	        if (ready()) { configure(c); keyReq.requestKeyFrame(); }
+   153	    }
+   154	
+   155	    private static byte[] typed(byte type, byte[] payload) {
+   156	        byte[] r = new byte[payload.length + 1];
+   157	        r[0] = type;
+   158	        System.arraycopy(payload, 0, r, 1, payload.length);
+   159	        return r;
+   160	    }
+   161	
+   162	    /** Server->client WebSocket frame (unmasked, FIN). */
+   163	    static byte[] frame(int opcode, byte[] p) {
+   164	        int n = p.length;
+   165	        int h = n < 126 ? 2 : (n < 65536 ? 4 : 10);
+   166	        byte[] f = new byte[h + n];
+   167	        f[0] = (byte) (0x80 | opcode);
+   168	        if (n < 126) {
+   169	            f[1] = (byte) n;
+   170	        } else if (n < 65536) {
+   171	            f[1] = 126; f[2] = (byte) (n >>> 8); f[3] = (byte) n;
+   172	        } else {
+   173	            f[1] = 127;
+   174	            long L = n;
+   175	            for (int i = 0; i < 8; i++) f[2 + i] = (byte) (L >>> (56 - 8 * i));
+   176	        }
+   177	        System.arraycopy(p, 0, f, h, n);
+   178	        return f;
+   179	    }
+   180	
+   181	    // ---------------- networking ----------------
+   182	
+   183	    private void acceptLoop() {
+   184	        while (running) {
+   185	            try {
+   186	                Socket s = server.accept();
+   187	                Thread t = new Thread(() -> handle(s), "http-conn");
+   188	                t.setDaemon(true);
+   189	                t.start();
+   190	            } catch (IOException e) {
+   191	                if (!running) return;
+   192	            }
+   193	        }
+   194	    }
+   195	
+   196	    private void handle(Socket s) {
+   197	        try {
+   198	            if (!isLocal(s.getInetAddress())) { s.close(); return; } // never serve the internet side
+   199	            s.setTcpNoDelay(true);
+   200	            s.setSoTimeout(15000);
+   201	            InputStream in = s.getInputStream();
+   202	            OutputStream out = s.getOutputStream();
+   203	            String head = readHead(in);
+   204	            if (head == null) { s.close(); return; }
+   205	            String[] lines = head.split("\r\n");
+   206	            String[] req = lines[0].split(" ");
+   207	            String path = req.length > 1 ? req[1] : "/";
+   208	            Map<String, String> hdr = new HashMap<>();
+   209	            for (int i = 1; i < lines.length; i++) {
+   210	                int c = lines[i].indexOf(':');
+   211	                if (c > 0) hdr.put(lines[i].substring(0, c).trim().toLowerCase(Locale.ROOT), lines[i].substring(c + 1).trim());
+   212	            }
+   213	            if (path.startsWith("/ws") && "websocket".equalsIgnoreCase(hdr.get("upgrade")) && hdr.containsKey("sec-websocket-key")) {
+   214	                String origin = hdr.get("origin"), host = hdr.get("host");
+   215	                if (origin != null && !origin.equals("http://" + host)) { // other web pages may not connect
+   216	                    respond(out, "403 Forbidden", "text/plain", "Forbidden".getBytes(StandardCharsets.US_ASCII));
+   217	                    s.close();
+   218	                    return;
+   219	                }
+   220	                String accept = Base64.getEncoder().encodeToString(MessageDigest.getInstance("SHA-1")
+   221	                        .digest((hdr.get("sec-websocket-key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+   222	                                .getBytes(StandardCharsets.US_ASCII)));
+   223	                out.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+   224	                        + "Sec-WebSocket-Accept: " + accept + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+   225	                out.flush();
+   226	                s.setSoTimeout(15000); // browser answers our pings; silence = dead viewer
+   227	                Client c = new Client(s, in, out);
+   228	                c.startThreads();
+   229	                join(c);
+   230	                return;
+   231	            }
+   232	            if (path.equals("/") || path.startsWith("/?") || path.startsWith("/index.html")) {
+   233	                respond(out, "200 OK", "text/html; charset=utf-8", page);
+   234	            } else {
+   235	                respond(out, "404 Not Found", "text/plain", "Not found".getBytes(StandardCharsets.US_ASCII));
+   236	            }
+   237	            s.close();
+   238	        } catch (Exception e) {
+   239	            try { s.close(); } catch (IOException ignored) {}
+   240	        }
+   241	    }
+   242	
+   243	    /** Private/link-local/loopback only (hotspot clients), IPv4 and IPv6. */
+   244	    static boolean isLocal(InetAddress a) {
+   245	        if (a == null) return false;
+   246	        if (a.isLoopbackAddress() || a.isSiteLocalAddress() || a.isLinkLocalAddress()) return true;
+   247	        if (a instanceof Inet6Address) return (a.getAddress()[0] & 0xFE) == 0xFC; // fc00::/7 ULA
+   248	        return false;
+   249	    }
+   250	
+   251	    private static void respond(OutputStream out, String status, String type, byte[] body) throws IOException {
+   252	        out.write(("HTTP/1.1 " + status + "\r\nContent-Type: " + type + "\r\nContent-Length: " + body.length
+   253	                + "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+   254	        out.write(body);
+   255	        out.flush();
+   256	    }
+   257	
+   258	    private static String readHead(InputStream in) throws IOException {
+   259	        ByteArrayOutputStream b = new ByteArrayOutputStream();
+   260	        int state = 0;
+   261	        while (b.size() < 16384) {
+   262	            int c = in.read();
+   263	            if (c < 0) return null;
+   264	            b.write(c);
+   265	            state = (c == '\r' && (state == 0 || state == 2)) ? state + 1
+   266	                  : (c == '\n' && (state == 1 || state == 3)) ? state + 1 : 0;
+   267	            if (state == 4) return b.toString("ISO-8859-1");
+   268	        }
+   269	        return null;
+   270	    }
+   271	
+   272	    private final class Client {
+   273	        final Socket s; final InputStream in; final OutputStream out;
+   274	        final LinkedBlockingQueue<byte[]> queue = new LinkedBlockingQueue<>();
+   275	        volatile boolean waitKey = true, configured = false, open = true;
+   276	        long lastRecoverMs;
+   277	
+   278	        Client(Socket s, InputStream in, OutputStream out) { this.s = s; this.in = in; this.out = out; }
+   279	
+   280	        boolean offer(byte[] f) {
+   281	            if (queue.size() >= QUEUE_LIMIT) return false;
+   282	            return queue.offer(f);
+   283	        }
+   284	
+   285	        void startThreads() {
+   286	            Thread w = new Thread(() -> {
+   287	                try {
+   288	                    long lastPing = System.currentTimeMillis();
+   289	                    while (open) {
+   290	                        byte[] f = queue.poll(500, TimeUnit.MILLISECONDS);
+   291	                        if (f != null) out.write(f);
+   292	                        long now = System.currentTimeMillis();
+   293	                        if (now - lastPing >= 5000) { out.write(PING); lastPing = now; }
+   294	                    }
+   295	                } catch (Exception e) { /* fall through */ }
+   296	                close();
+   297	            }, "ws-writer");
+   298	            w.setDaemon(true);
+   299	            w.start();
+   300	            Thread r = new Thread(() -> {
+   301	                try { readFrames(); } catch (Exception ignored) {}
+   302	                close();
+   303	            }, "ws-reader");
+   304	            r.setDaemon(true);
+   305	            r.start();
+   306	        }
+   307	
+   308	        /** Reads and discards client frames; returns on close/EOF. */
+   309	        private void readFrames() throws IOException {
+   310	            while (open) {
+   311	                int b0 = in.read(), b1 = in.read();
+   312	                if (b0 < 0 || b1 < 0) return;
+   313	                long len = b1 & 0x7F;
+   314	                if (len == 126) len = (rd(in) << 8) | rd(in);
+   315	                else if (len == 127) { len = 0; for (int i = 0; i < 8; i++) len = (len << 8) | rd(in); }
+   316	                if ((b1 & 0x80) != 0) for (int i = 0; i < 4; i++) rd(in);
+   317	                for (long i = 0; i < len; i++) rd(in);
+   318	                if ((b0 & 0x0F) == 0x8) return; // close
+   319	            }
+   320	        }
+   321	
+   322	        private int rd(InputStream in) throws IOException {
+   323	            int c = in.read();
+   324	            if (c < 0) throw new IOException("eof");
+   325	            return c;
+   326	        }
+   327	
+   328	        void close() {
+   329	            if (!open) return;
+   330	            open = false;
+   331	            clients.remove(this);
+   332	            try { s.close(); } catch (IOException ignored) {}
+   333	        }
+   334	    }
+   335	}
+
+===== FILE: app/src/main/java/com/apptesla/mirror/StreamService.java =====
+     1	package com.apptesla.mirror;
+     2	
+     3	import android.Manifest;
+     4	import android.app.Notification;
+     5	import android.app.NotificationChannel;
+     6	import android.app.NotificationManager;
+     7	import android.app.PendingIntent;
+     8	import android.app.Service;
+     9	import android.content.Intent;
+    10	import android.content.pm.PackageManager;
+    11	import android.content.pm.ServiceInfo;
+    12	import android.graphics.Point;
+    13	import android.hardware.display.DisplayManager;
+    14	import android.hardware.display.VirtualDisplay;
+    15	import android.media.projection.MediaProjection;
+    16	import android.media.projection.MediaProjectionManager;
+    17	import android.os.Build;
+    18	import android.os.Handler;
+    19	import android.os.HandlerThread;
+    20	import android.os.IBinder;
+    21	import android.os.PowerManager;
+    22	import android.util.DisplayMetrics;
+    23	import android.util.Log;
+    24	import android.view.Display;
+    25	
+    26	import java.io.ByteArrayOutputStream;
+    27	import java.io.InputStream;
+    28	
+    29	/** Foreground service: screen + audio capture -> encoders -> local HTTP/WebSocket server. */
+    30	public class StreamService extends Service {
+    31	    static final String EXTRA_CODE = "code", EXTRA_DATA = "data", ACTION_STOP = "stop";
+    32	    static final int PORT = 8080;
+    33	    private static final String TAG = "TeslaMirror";
+    34	    private static final String CHANNEL = "mirror";
+    35	
+    36	    interface StatusListener { void onStatusChanged(); }
+    37	    static volatile boolean running;
+    38	    static volatile String lastError;
+    39	    static volatile StatusListener listener;
+    40	
+    41	    private HandlerThread thread;
+    42	    private Handler handler;
+    43	    private MediaProjection projection;
+    44	    private VirtualDisplay display;
+    45	    private volatile VideoEncoder video;
+    46	    private AudioEncoder audio;
+    47	    private StreamServer server;
+    48	    private DisplayManager.DisplayListener displayListener;
+    49	    private boolean landscape;
+    50	    private long t0Us;
+    51	    private boolean stopping;
+    52	    private PowerManager.WakeLock wakeLock;
+    53	    private boolean owner; // this instance owns the static 'running' flag
+    54	
+    55	    @Override public IBinder onBind(Intent intent) { return null; }
+    56	
+    57	    @Override
+    58	    public int onStartCommand(Intent intent, int flags, int startId) {
+    59	        if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+    60	            stopSelf();
+    61	            return START_NOT_STICKY;
+    62	        }
+    63	        if (intent == null) return START_NOT_STICKY;
+    64	
+    65	        createChannel();
+    66	        // Android 14+: must be foreground with type mediaProjection BEFORE getMediaProjection().
+    67	        // Microphone type is added only when RECORD_AUDIO is granted (needed for audio capture in FGS).
+    68	        int fgsType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
+    69	        if (Build.VERSION.SDK_INT >= 30
+    70	                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+    71	            fgsType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+    72	        }
+    73	        startForeground(1, buildNotification(), fgsType);
+    74	        if (running) {
+    75	            // Same live instance: ignore. New instance while the old one is still closing: bail out.
+    76	            if (projection == null) {
+    77	                lastError = "Önceki yayın kapanıyor, birkaç saniye sonra tekrar deneyin.";
+    78	                notifyStatus();
+    79	                stopSelf();
+    80	            }
+    81	            return START_NOT_STICKY;
+    82	        }
+    83	
+    84	        int code = intent.getIntExtra(EXTRA_CODE, 0);
+    85	        Intent data;
+    86	        if (Build.VERSION.SDK_INT >= 33) data = intent.getParcelableExtra(EXTRA_DATA, Intent.class);
+    87	        else data = intent.getParcelableExtra(EXTRA_DATA);
+    88	        MediaProjectionManager mpm = getSystemService(MediaProjectionManager.class);
+    89	        projection = data == null ? null : mpm.getMediaProjection(code, data);
+    90	        if (projection == null) {
+    91	            fail("Ekran yakalama izni alınamadı");
+    92	            return START_NOT_STICKY;
+    93	        }
+    94	
+    95	        thread = new HandlerThread("mirror");
+    96	        thread.start();
+    97	        handler = new Handler(thread.getLooper());
+    98	        // Android 14+: callback must be registered before createVirtualDisplay().
+    99	        projection.registerCallback(new MediaProjection.Callback() {
+   100	            @Override public void onStop() {
+   101	                // Android 15 QPR1+ ends screen sharing when the phone locks.
+   102	                if (!stopping) lastError = "Paylaşım sistem tarafından durduruldu (telefon kilitlenmiş olabilir).";
+   103	                handler.post(StreamService.this::stopSelf);
+   104	            }
+   105	        }, handler);
+   106	
+   107	        // Keep the screen on (dimmed allowed) while streaming: a locked phone stops the share.
+   108	        acquireScreenLock();
+   109	        running = true;
+   110	        owner = true;
+   111	        lastError = null;
+   112	        notifyStatus();
+   113	        handler.post(this::startPipeline);
+   114	        return START_NOT_STICKY;
+   115	    }
+   116	
+   117	    private void startPipeline() {
+   118	        try {
+   119	            t0Us = System.nanoTime() / 1000;
+   120	            final StreamServer srv = new StreamServer(PORT, readAsset("index.html"), () -> {
+   121	                VideoEncoder v = video;
+   122	                if (v != null) v.requestKeyFrame();
+   123	            });
+   124	            server = srv;
+   125	            srv.start();
+   126	
+   127	            startVideo();
+   128	
+   129	            boolean audioOk = false;
+   130	            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+   131	                try {
+   132	                    audio = new AudioEncoder(projection, t0Us, new AudioEncoder.Sink() {
+   133	                        @Override public void onAudioInit(byte[] init, String codec) { srv.setAudioInit(init, codec); }
+   134	                        @Override public void onAudioFragment(byte[] f) { srv.sendAudio(f); }
+   135	                    });
+   136	                    audio.start();
+   137	                    audioOk = true;
+   138	                } catch (Exception e) {
+   139	                    Log.w(TAG, "audio capture unavailable", e);
+   140	                    audio = null;
+   141	                }
+   142	            }
+   143	            if (!audioOk) srv.setAudioExpected(false);
+   144	
+   145	            DisplayManager dm = getSystemService(DisplayManager.class);
+   146	            displayListener = new DisplayManager.DisplayListener() {
+   147	                @Override public void onDisplayAdded(int id) {}
+   148	                @Override public void onDisplayRemoved(int id) {}
+   149	                @Override public void onDisplayChanged(int id) {
+   150	                    if (id == Display.DEFAULT_DISPLAY) handler.post(StreamService.this::checkRotation);
+   151	                }
+   152	            };
+   153	            dm.registerDisplayListener(displayListener, handler);
+   154	        } catch (Exception e) {
+   155	            Log.e(TAG, "start failed", e);
+   156	            fail("Başlatılamadı: " + e.getMessage());
+   157	        }
+   158	    }
+   159	
+   160	    private Point screenSize() {
+   161	        Display d = getSystemService(DisplayManager.class).getDisplay(Display.DEFAULT_DISPLAY);
+   162	        DisplayMetrics m = new DisplayMetrics();
+   163	        d.getRealMetrics(m);
+   164	        return new Point(m.widthPixels, m.heightPixels);
+   165	    }
+   166	
+   167	    private int densityDpi() {
+   168	        Display d = getSystemService(DisplayManager.class).getDisplay(Display.DEFAULT_DISPLAY);
+   169	        DisplayMetrics m = new DisplayMetrics();
+   170	        d.getRealMetrics(m);
+   171	        return m.densityDpi;
+   172	    }
+   173	
+   174	    private void startVideo() throws Exception {
+   175	        Point s = screenSize();
+   176	        landscape = s.x > s.y;
+   177	        final StreamServer srv = server;
+   178	        VideoEncoder v = VideoEncoder.create(s.x, s.y, t0Us, new VideoEncoder.Sink() {
+   179	            @Override public void onVideoInit(byte[] init, String codec) { srv.setVideoInit(init, codec); }
+   180	            @Override public void onVideoFragment(byte[] f, boolean key) { srv.sendVideo(f, key); }
+   181	        });
+   182	        if (display == null) {
+   183	            display = projection.createVirtualDisplay("TeslaMirror", v.width, v.height, densityDpi(),
+   184	                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, v.surface, null, handler);
+   185	        } else {
+   186	            display.resize(v.width, v.height, densityDpi());
+   187	            display.setSurface(v.surface);
+   188	        }
+   189	        video = v;
+   190	        v.start();
+   191	    }
+   192	
+   193	    /** Phone rotated (e.g. full-screen video): rebuild encoder at the new orientation. */
+   194	    private void checkRotation() {
+   195	        if (stopping || video == null) return;
+   196	        Point s = screenSize();
+   197	        if ((s.x > s.y) == landscape) return;
+   198	        try {
+   199	            display.setSurface(null);
+   200	            VideoEncoder old = video;
+   201	            video = null;
+   202	            old.stop();
+   203	            startVideo();
+   204	        } catch (Exception e) {
+   205	            Log.e(TAG, "rotation restart failed", e);
+   206	            fail("Döndürme sonrası video yeniden başlatılamadı");
+   207	        }
+   208	    }
+   209	
+   210	    private void fail(String msg) {
+   211	        lastError = msg;
+   212	        notifyStatus();
+   213	        stopSelf();
+   214	    }
+   215	
+   216	    @SuppressWarnings("deprecation")
+   217	    private void acquireScreenLock() {
+   218	        try {
+   219	            PowerManager pm = getSystemService(PowerManager.class);
+   220	            wakeLock = pm.newWakeLock(PowerManager.SCREEN_DIM_WAKE_LOCK, "TeslaMirror:screen");
+   221	            wakeLock.acquire(4 * 60 * 60 * 1000L); // safety cap: 4 h
+   222	        } catch (Exception e) {
+   223	            Log.w(TAG, "wake lock failed", e);
+   224	        }
+   225	    }
+   226	
+   227	    @Override
+   228	    public void onDestroy() {
+   229	        stopping = true;
+   230	        try { if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); } catch (Exception ignored) {}
+   231	        if (handler != null) {
+   232	            // Tear down on the pipeline thread, then quit it; 'running' stays true until done
+   233	            // so a quick restart can't collide with the old server socket.
+   234	            handler.post(() -> { teardown(); if (owner) running = false; notifyStatus(); });
+   235	            thread.quitSafely();
+   236	        } else {
+   237	            teardown();
+   238	            if (owner) running = false;
+   239	            notifyStatus();
+   240	        }
+   241	        super.onDestroy();
+   242	    }
+   243	
+   244	    private void teardown() {
+   245	        if (server != null) { server.stop(); server = null; } // free the port first
+   246	        try {
+   247	            if (displayListener != null) getSystemService(DisplayManager.class).unregisterDisplayListener(displayListener);
+   248	        } catch (Exception ignored) {}
+   249	        if (audio != null) { audio.stop(); audio = null; }
+   250	        VideoEncoder v = video;
+   251	        video = null;
+   252	        if (display != null) { display.setSurface(null); display.release(); display = null; }
+   253	        if (v != null) v.stop();
+   254	        if (projection != null) { try { projection.stop(); } catch (Exception ignored) {} projection = null; }
+   255	    }
+   256	
+   257	    private void notifyStatus() {
+   258	        StatusListener l = listener;
+   259	        if (l != null) l.onStatusChanged();
+   260	    }
+   261	
+   262	    private void createChannel() {
+   263	        NotificationChannel ch = new NotificationChannel(CHANNEL, "Ekran yansıtma", NotificationManager.IMPORTANCE_LOW);
+   264	        getSystemService(NotificationManager.class).createNotificationChannel(ch);
+   265	    }
+   266	
+   267	    private Notification buildNotification() {
+   268	        PendingIntent open = PendingIntent.getActivity(this, 0,
+   269	                new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
+   270	        PendingIntent stop = PendingIntent.getService(this, 1,
+   271	                new Intent(this, StreamService.class).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE);
+   272	        return new Notification.Builder(this, CHANNEL)
+   273	                .setSmallIcon(android.R.drawable.ic_menu_upload)
+   274	                .setContentTitle("TeslaMirror yayında")
+   275	                .setContentText("Tesla tarayıcısında uygulamadaki adresi açın")
+   276	                .setContentIntent(open)
+   277	                .addAction(new Notification.Action.Builder(null, "Durdur", stop).build())
+   278	                .setOngoing(true)
+   279	                .build();
+   280	    }
+   281	
+   282	    private byte[] readAsset(String name) throws Exception {
+   283	        try (InputStream in = getAssets().open(name)) {
+   284	            ByteArrayOutputStream o = new ByteArrayOutputStream();
+   285	            byte[] b = new byte[8192];
+   286	            int n;
+   287	            while ((n = in.read(b)) > 0) o.write(b, 0, n);
+   288	            return o.toByteArray();
+   289	        }
+   290	    }
+   291	}
+
+===== FILE: app/src/main/java/com/apptesla/mirror/VideoEncoder.java =====
+     1	package com.apptesla.mirror;
+     2	
+     3	import android.media.MediaCodec;
+     4	import android.media.MediaCodecInfo;
+     5	import android.media.MediaFormat;
+     6	import android.os.Bundle;
+     7	import android.util.Log;
+     8	import android.view.Surface;
+     9	
+    10	import java.io.IOException;
+    11	import java.nio.ByteBuffer;
+    12	import java.util.List;
+    13	
+    14	/** Screen frames (input Surface) -> H.264 -> fMP4 fragments. */
+    15	final class VideoEncoder {
+    16	    interface Sink {
+    17	        void onVideoInit(byte[] init, String codec);
+    18	        void onVideoFragment(byte[] fragment, boolean key);
+    19	    }
+    20	
+    21	    private static final String TAG = "TeslaMirror";
+    22	    private static final String MIME = MediaFormat.MIMETYPE_VIDEO_AVC;
+    23	    private static final int[] MAX_SIDES = {1920, 1600, 1280, 960};
+    24	
+    25	    final int width, height;
+    26	    final Surface surface;
+    27	    private final MediaCodec codec;
+    28	    private final long t0Us;
+    29	    private final Sink sink;
+    30	    private volatile boolean stop;
+    31	    private Thread thread;
+    32	
+    33	    private VideoEncoder(MediaCodec codec, int w, int h, long t0Us, Sink sink) {
+    34	        this.codec = codec; this.width = w; this.height = h; this.t0Us = t0Us; this.sink = sink;
+    35	        this.surface = codec.createInputSurface();
+    36	    }
+    37	
+    38	    /** Picks the largest size (long side <= 1920) the hardware encoder accepts. */
+    39	    static VideoEncoder create(int srcW, int srcH, long t0Us, Sink sink) throws IOException {
+    40	        MediaCodec codec = MediaCodec.createEncoderByType(MIME);
+    41	        MediaCodecInfo.VideoCapabilities caps =
+    42	                codec.getCodecInfo().getCapabilitiesForType(MIME).getVideoCapabilities();
+    43	        for (int max : MAX_SIDES) {
+    44	            double scale = Math.min(1.0, (double) max / Math.max(srcW, srcH));
+    45	            int w = ((int) (srcW * scale)) & ~15;
+    46	            int h = ((int) (srcH * scale)) & ~15;
+    47	            if (w < 160 || h < 160) continue;
+    48	            if (caps != null && !caps.areSizeAndRateSupported(w, h, 30)) continue;
+    49	            try {
+    50	                codec.configure(format(w, h), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+    51	            } catch (Exception e) {
+    52	                Log.w(TAG, "configure failed for " + w + "x" + h, e);
+    53	                codec.reset();
+    54	                continue;
+    55	            }
+    56	            try {
+    57	                Log.i(TAG, "video encoder " + codec.getName() + " " + w + "x" + h);
+    58	                return new VideoEncoder(codec, w, h, t0Us, sink);
+    59	            } catch (Exception e) {          // createInputSurface failed
+    60	                codec.release();
+    61	                throw new IOException("Video kodlayıcı yüzeyi oluşturulamadı", e);
+    62	            }
+    63	        }
+    64	        codec.release();
+    65	        throw new IOException("Uygun video kodlayıcı boyutu bulunamadı");
+    66	    }
+    67	
+    68	    private static MediaFormat format(int w, int h) {
+    69	        MediaFormat f = MediaFormat.createVideoFormat(MIME, w, h);
+    70	        f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
+    71	        int bitrate = (int) Math.max(2_000_000, Math.min(8_000_000, (long) w * h * 30 / 6));
+    72	        f.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
+    73	        f.setInteger(MediaFormat.KEY_FRAME_RATE, 30);
+    74	        f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
+    75	        // Static screen still produces frames, so the player never starves.
+    76	        f.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000);
+    77	        f.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
+    78	        f.setInteger(MediaFormat.KEY_PRIORITY, 0); // realtime
+    79	        return f;
+    80	    }
+    81	
+    82	    void start() {
+    83	        codec.start();
+    84	        thread = new Thread(this::drain, "video-enc");
+    85	        thread.start();
+    86	    }
+    87	
+    88	    void requestKeyFrame() {
+    89	        try {
+    90	            Bundle b = new Bundle();
+    91	            b.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
+    92	            codec.setParameters(b);
+    93	        } catch (Exception ignored) {}
+    94	    }
+    95	
+    96	    void stop() {
+    97	        stop = true;
+    98	        if (thread != null) {
+    99	            try { thread.join(1000); } catch (InterruptedException ignored) {}
+   100	        }
+   101	        try { codec.stop(); } catch (Exception ignored) {}
+   102	        try { codec.release(); } catch (Exception ignored) {}
+   103	        surface.release();
+   104	    }
+   105	
+   106	    private void drain() {
+   107	        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+   108	        byte[] sps = null, pps = null;
+   109	        boolean inited = false;
+   110	        long offsetUs = Long.MIN_VALUE;
+   111	        int seq = 1;
+   112	        long pendT = -1, lastEnd = 0, pendArrivalNs = 0; byte[] pendSample = null; boolean pendKey = false;
+   113	        try {
+   114	            while (!stop) {
+   115	                int idx = codec.dequeueOutputBuffer(info, 10_000);
+   116	                if (idx < 0) {
+   117	                    // Screen went still: don't hold the last frame back, publish it now.
+   118	                    if (pendSample != null && System.nanoTime() - pendArrivalNs > 50_000_000L) {
+   119	                        long nowT = (System.nanoTime() / 1000 - t0Us) * 9 / 100;
+   120	                        int dur = (int) Math.max(3000, Math.min(nowT - pendT, 90_000));
+   121	                        sink.onVideoFragment(Fmp4.fragment(seq++, pendT, dur, pendSample,
+   122	                                pendKey ? Fmp4.FLAGS_SYNC : Fmp4.FLAGS_NON_SYNC), pendKey);
+   123	                        lastEnd = pendT + dur;
+   124	                        pendSample = null;
+   125	                    }
+   126	                    continue;
+   127	                }
+   128	                ByteBuffer bb = codec.getOutputBuffer(idx);
+   129	                byte[] data = new byte[info.size];
+   130	                if (bb != null && info.size > 0) {
+   131	                    bb.position(info.offset);
+   132	                    bb.limit(info.offset + info.size);
+   133	                    bb.get(data);
+   134	                }
+   135	                int flags = info.flags;
+   136	                long pts = info.presentationTimeUs;
+   137	                codec.releaseOutputBuffer(idx, false);
+   138	                if ((flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
+   139	                if (data.length == 0) continue;
+   140	
+   141	                List<byte[]> nals = AnnexB.split(data, 0, data.length);
+   142	                boolean key = (flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
+   143	                for (byte[] n : nals) {
+   144	                    int t = AnnexB.type(n);
+   145	                    if (t == 7) sps = n;
+   146	                    else if (t == 8) pps = n;
+   147	                    else if (t == 5) key = true;
+   148	                }
+   149	                if (!inited && sps != null && pps != null) {
+   150	                    sink.onVideoInit(Fmp4.videoInit(sps, pps, width, height), Fmp4.videoCodec(sps));
+   151	                    inited = true;
+   152	                }
+   153	                if ((flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0 || !inited) continue;
+   154	
+   155	                byte[] sample = AnnexB.toAvcc(nals);
+   156	                if (sample.length == 0) continue;
+   157	
+   158	                if (offsetUs == Long.MIN_VALUE) {
+   159	                    long now = System.nanoTime() / 1000;
+   160	                    offsetUs = Math.abs(now - pts) > 1_000_000 ? now - pts : 0;
+   161	                    if (offsetUs != 0) Log.w(TAG, "video pts not on monotonic clock, offset " + offsetUs);
+   162	                }
+   163	                long t = Math.max(0, (pts + offsetUs - t0Us) * 9 / 100); // us -> 90 kHz
+   164	                if (pendSample == null && t <= lastEnd - 3000) t = lastEnd; // never go backwards after an idle flush
+   165	
+   166	                if (pendSample != null) {
+   167	                    if (t <= pendT) t = pendT + 1;
+   168	                    int dur = (int) Math.min(t - pendT, 90_000);
+   169	                    sink.onVideoFragment(Fmp4.fragment(seq++, pendT, dur, pendSample,
+   170	                            pendKey ? Fmp4.FLAGS_SYNC : Fmp4.FLAGS_NON_SYNC), pendKey);
+   171	                }
+   172	                pendT = t; pendSample = sample; pendKey = key; pendArrivalNs = System.nanoTime();
+   173	            }
+   174	        } catch (Exception e) {
+   175	            if (!stop) Log.e(TAG, "video drain error", e);
+   176	        }
+   177	    }
+   178	}
+
+===== FILE: app/src/main/assets/index.html =====
+     1	<!doctype html>
+     2	<html lang="tr">
+     3	<head>
+     4	<meta charset="utf-8">
+     5	<meta name="viewport" content="width=device-width,initial-scale=1">
+     6	<title>Tesla Mirror</title>
+     7	<style>
+     8	  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#fff}
+     9	  video{position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+    10	  #ov{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;background:rgba(0,0,0,.88);z-index:2}
+    11	  #ov.hide{display:none}
+    12	  #go{font-size:30px;padding:20px 56px;border:0;border-radius:16px;background:#e82127;color:#fff;cursor:pointer}
+    13	  #msg{font-size:18px;opacity:.75;text-align:center;max-width:80vw}
+    14	  #st{position:fixed;left:14px;bottom:12px;font-size:14px;opacity:.55;z-index:3;pointer-events:none}
+    15	  #fs{position:fixed;right:14px;top:12px;z-index:3;font-size:16px;padding:8px 14px;border:0;border-radius:10px;background:rgba(255,255,255,.12);color:#fff;opacity:.5}
+    16	</style>
+    17	</head>
+    18	<body>
+    19	<video id="v" playsinline muted></video>
+    20	<audio id="a"></audio>
+    21	<button id="fs" title="Tam ekran">⛶</button>
+    22	<div id="ov">
+    23	  <button id="go">▶ Başlat</button>
+    24	  <div id="msg">Telefonda TeslaMirror yayını açık olmalı. Ses için bu düğmeye dokunmak gerekir.</div>
+    25	</div>
+    26	<div id="st"></div>
+    27	<script>
+    28	(() => {
+    29	  'use strict';
+    30	  // Video and audio play in separate elements: a still screen (no new video frames)
+    31	  // must not stall the sound. Audio is the master clock; video follows it.
+    32	  const v = document.getElementById('v');
+    33	  const au = document.getElementById('a');
+    34	  const ov = document.getElementById('ov');
+    35	  const msg = document.getElementById('msg');
+    36	  const st = document.getElementById('st');
+    37	  const LIVE_TARGET = 0.12, MAX_LAG = 0.8;
+    38	  let ws = null, tracks = null, gen = 0, started = false, fatal = false;
+    39	
+    40	  const status = (t) => { st.textContent = t || ''; };
+    41	
+    42	  function makeTrack(el, mime, myGen) {
+    43	    const t = { el, sb: null, q: [], ms: new MediaSource() };
+    44	    const url = URL.createObjectURL(t.ms);
+    45	    el.src = url;
+    46	    t.ms.addEventListener('sourceopen', () => {
+    47	      URL.revokeObjectURL(url);
+    48	      if (myGen !== gen) return;
+    49	      try {
+    50	        t.sb = t.ms.addSourceBuffer(mime);
+    51	      } catch (e) {
+    52	        fatal = true;
+    53	        tracks = null;
+    54	        status('Bu tarayıcı yayın biçimini desteklemiyor: ' + mime);
+    55	        try { ws.close(); } catch (_) {}
+    56	        return;
+    57	      }
+    58	      t.sb.addEventListener('updateend', () => pump(t));
+    59	      pump(t);
+    60	    }, { once: true });
+    61	    return t;
+    62	  }
+    63	
+    64	  function build(cfg) {
+    65	    const myGen = ++gen;
+    66	    tracks = {
+    67	      v: makeTrack(v, 'video/mp4; codecs="' + cfg.v + '"', myGen),
+    68	      a: cfg.a ? makeTrack(au, 'audio/mp4; codecs="' + cfg.a + '"', myGen) : null,
+    69	    };
+    70	    if (!cfg.a) { au.removeAttribute('src'); au.load(); }
+    71	    status(cfg.a ? '' : 'Ses yok (telefonda ses izni verilmedi)');
+    72	  }
+    73	
+    74	  function isCurrent(t) { return tracks && (t === tracks.v || t === tracks.a); }
+    75	
+    76	  function pump(t) {
+    77	    if (!isCurrent(t) || !t.sb || t.sb.updating || !t.q.length || t.ms.readyState !== 'open') return;
+    78	    try {
+    79	      t.sb.appendBuffer(t.q[0]);
+    80	      t.q.shift();                       // only after a successful append
+    81	    } catch (e) {
+    82	      if (e.name === 'QuotaExceededError') {
+    83	        if (!trimTrack(t, 1)) t.q.length = 0;   // nothing removable: drop backlog
+    84	      } else {
+    85	        status('Oynatma hatası: ' + e.message);
+    86	      }
+    87	    }
+    88	  }
+    89	
+    90	  function trimTrack(t, keepSec) {
+    91	    const upto = t.el.currentTime - keepSec;
+    92	    if (!t.sb || t.sb.updating || upto <= 0 || !t.sb.buffered.length || t.sb.buffered.start(0) >= upto) return false;
+    93	    try { t.sb.remove(0, upto); return true; } catch (_) { return false; }
+    94	  }
+    95	
+    96	  function connect() {
+    97	    if (fatal) return;
+    98	    status('Bağlanıyor…');
+    99	    ws = new WebSocket('ws://' + location.host + '/ws');
+   100	    ws.binaryType = 'arraybuffer';
+   101	    ws.onmessage = (e) => {
+   102	      if (typeof e.data === 'string') {
+   103	        let m; try { m = JSON.parse(e.data); } catch (_) { return; }
+   104	        if (m.type === 'config') build(m);
+   105	        return;
+   106	      }
+   107	      if (!tracks) return;
+   108	      const d = new Uint8Array(e.data);
+   109	      const k = d[0];
+   110	      const t = (k === 1 || k === 2) ? tracks.v : (k === 3 || k === 4) ? tracks.a : null;
+   111	      if (!t) return;
+   112	      t.q.push(d.subarray(1));
+   113	      if (t.q.length > 600) t.q.length = 0; // runaway safety (e.g. MediaSource never opened)
+   114	      pump(t);
+   115	    };
+   116	    ws.onclose = () => {
+   117	      tracks = null;
+   118	      if (fatal) return;
+   119	      status('Bağlantı koptu, yeniden deneniyor…');
+   120	      setTimeout(connect, 1500);
+   121	    };
+   122	    ws.onerror = () => { try { ws.close(); } catch (_) {} };
+   123	  }
+   124	
+   125	  function lastRange(r) { return r.length ? [r.start(r.length - 1), r.end(r.length - 1)] : null; }
+   126	  function inRanges(r, x) { for (let i = 0; i < r.length; i++) if (x >= r.start(i) && x <= r.end(i)) return true; return false; }
+   127	
+   128	  // Master element stays close to the live edge.
+   129	  function chase(el) {
+   130	    const lr = lastRange(el.buffered);
+   131	    if (!lr) return;
+   132	    const [start, end] = lr;
+   133	    const lag = end - el.currentTime;
+   134	    if (el.currentTime < start || lag > MAX_LAG) el.currentTime = Math.max(start, end - LIVE_TARGET);
+   135	    else el.playbackRate = lag > 0.3 ? 1.08 : 1.0;
+   136	    if (el.paused && end - start > 0.05) el.play().catch(() => {});
+   137	  }
+   138	
+   139	  // Video follows the audio clock; on a still screen it just holds the last frame.
+   140	  function follow(target) {
+   141	    const r = v.buffered, lr = lastRange(r);
+   142	    if (!lr) return;
+   143	    const [start, end] = lr;
+   144	    if (target < start) {                      // video is ahead of the sound: hold on its first frame
+   145	      if (v.currentTime !== start) v.currentTime = start;
+   146	      if (!v.paused) v.pause();
+   147	      return;
+   148	    }
+   149	    if (inRanges(r, target)) {
+   150	      const diff = target - v.currentTime;     // >0: video behind audio
+   151	      if (Math.abs(diff) > 0.15) { v.currentTime = target; v.playbackRate = au.playbackRate; }
+   152	      else if (Math.abs(diff) > 0.03) v.playbackRate = au.playbackRate * (diff > 0 ? 1.1 : 0.9);
+   153	      else v.playbackRate = au.playbackRate;
+   154	    } else if (target > end) {                 // still screen: keep showing the last frame
+   155	      if (v.currentTime < end - 0.05) v.currentTime = Math.max(start, end - 0.01);
+   156	    }
+   157	    if (v.paused) v.play().catch(() => {});
+   158	  }
+   159	
+   160	  setInterval(() => {
+   161	    if (!tracks || !tracks.v.sb) return;
+   162	    if (tracks.a && tracks.a.sb) {
+   163	      chase(au);
+   164	      follow(au.currentTime);
+   165	      trimTrack(tracks.a, 10);
+   166	    } else {
+   167	      chase(v);
+   168	    }
+   169	    trimTrack(tracks.v, 10);
+   170	  }, 250);
+   171	
+   172	  function fullscreen() {
+   173	    const el = document.documentElement;
+   174	    const f = el.requestFullscreen || el.webkitRequestFullscreen;
+   175	    if (f) { try { const p = f.call(el); if (p && p.catch) p.catch(() => {}); } catch (_) {} }
+   176	  }
+   177	
+   178	  document.getElementById('go').onclick = () => {
+   179	    if (!window.MediaSource) { msg.textContent = 'Bu tarayıcı MediaSource desteklemiyor.'; return; }
+   180	    ov.classList.add('hide');
+   181	    au.muted = false;
+   182	    au.play().catch(() => {});   // unlock audio inside the user gesture
+   183	    fullscreen();
+   184	    if (!started) { started = true; connect(); }
+   185	  };
+   186	  document.getElementById('fs').onclick = fullscreen;
+   187	})();
+   188	</script>
+   189	</body>
+   190	</html>
+
