@@ -2,20 +2,28 @@ package com.apptesla.mirror;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.media.projection.MediaProjectionConfig;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.Gravity;
+import android.view.View;
 import android.view.ViewGroup;
-import android.widget.Button;
-import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.view.WindowInsets;
+import android.widget.Button;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.PopupMenu;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -25,19 +33,23 @@ import java.net.NetworkInterface;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 
 public class MainActivity extends Activity {
     private static final int REQ_PERMS = 1, REQ_CAPTURE = 2;
-    private TextView info;
+    private static final int LINK_BLUE = Color.rgb(77, 163, 255);
+
+    private LinearLayout root;
+    private TextView info, notes, langButton;
+    private LinearLayout links;
     private Button button;
 
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
-        LinearLayout root = new LinearLayout(this);
+
+        root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setGravity(Gravity.CENTER_HORIZONTAL);
-        root.setBackgroundColor(Color.rgb(18, 18, 18));
         int pad = dp(24);
         root.setPadding(pad, pad, pad, pad);
 
@@ -46,7 +58,8 @@ public class MainActivity extends Activity {
         title.setTextSize(30);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setTextColor(Color.WHITE);
-        root.addView(title);
+        title.setGravity(Gravity.CENTER_HORIZONTAL);
+        root.addView(title, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         button = new Button(this);
         button.setTextSize(20);
@@ -61,28 +74,68 @@ public class MainActivity extends Activity {
             }
         });
 
-        info = new TextView(this);
-        info.setTextSize(17);
-        info.setTextColor(Color.rgb(220, 220, 220));
-        info.setLineSpacing(0, 1.2f);
-        LinearLayout.LayoutParams ip = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        ip.topMargin = dp(24);
-        root.addView(info, ip);
+        info = text(17, Color.rgb(220, 220, 220));
+        root.addView(info, block(24));
 
-        // targetSdk 35+ is edge-to-edge: pad by system bars/cutout and allow scrolling.
+        links = new LinearLayout(this);
+        links.setOrientation(LinearLayout.VERTICAL);
+        root.addView(links, block(8));
+
+        notes = text(15, Color.rgb(180, 180, 180));
+        root.addView(notes, block(16));
+
         ScrollView scroll = new ScrollView(this);
-        scroll.setBackgroundColor(Color.rgb(18, 18, 18));
         scroll.setFillViewport(true);
         scroll.addView(root);
-        scroll.setOnApplyWindowInsetsListener((view, insets) -> {
+
+        // Round language badge, always at the top-right corner as the user sees it.
+        langButton = new TextView(this);
+        langButton.setGravity(Gravity.CENTER);
+        langButton.setTextColor(Color.WHITE);
+        langButton.setTextSize(14);
+        langButton.setTypeface(Typeface.DEFAULT_BOLD);
+        GradientDrawable circle = new GradientDrawable();
+        circle.setShape(GradientDrawable.OVAL);
+        circle.setColor(Color.rgb(45, 45, 45));
+        circle.setStroke(dp(2), Color.rgb(200, 200, 200));
+        langButton.setBackground(circle);
+        langButton.setOnClickListener(v -> showLanguageList());
+
+        FrameLayout frame = new FrameLayout(this);
+        frame.setBackgroundColor(Color.rgb(18, 18, 18));
+        frame.addView(scroll, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        FrameLayout.LayoutParams bp = new FrameLayout.LayoutParams(dp(46), dp(46), Gravity.TOP | Gravity.RIGHT);
+        bp.topMargin = dp(12);
+        bp.rightMargin = dp(12);
+        frame.addView(langButton, bp);
+        frame.setLayoutDirection(View.LAYOUT_DIRECTION_LTR); // keep the badge on the right even in Arabic
+
+        // targetSdk 35+ is edge-to-edge: pad by system bars/cutout.
+        frame.setOnApplyWindowInsetsListener((view, insets) -> {
             if (Build.VERSION.SDK_INT >= 30) {
                 android.graphics.Insets i = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
                 view.setPadding(i.left, i.top, i.right, i.bottom);
             }
             return insets;
         });
-        setContentView(scroll);
+        setContentView(frame);
     }
+
+    private TextView text(int sp, int color) {
+        TextView t = new TextView(this);
+        t.setTextSize(sp);
+        t.setTextColor(color);
+        t.setLineSpacing(0, 1.2f);
+        return t;
+    }
+
+    private LinearLayout.LayoutParams block(int topDp) {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        p.topMargin = dp(topDp);
+        return p;
+    }
+
+    private String t(String key) { return I18n.t(this, key); }
 
     @Override
     protected void onResume() {
@@ -97,31 +150,91 @@ public class MainActivity extends Activity {
         super.onPause();
     }
 
+    private void showLanguageList() {
+        String[] items = new String[I18n.CODES.length];
+        for (int i = 0; i < items.length; i++)
+            items[i] = I18n.NAMES[i] + "  (" + I18n.CODES[i].toUpperCase(Locale.ROOT) + ")";
+        int cur = I18n.index(I18n.current(this));
+        new AlertDialog.Builder(this)
+                .setTitle(t("lang_title"))
+                .setSingleChoiceItems(items, cur, (d, which) -> {
+                    I18n.set(this, I18n.CODES[which]);
+                    d.dismiss();
+                    StreamService.onLanguageChanged();
+                    refresh();
+                })
+                .show();
+    }
+
     private void refresh() {
+        boolean rtl = I18n.rtl(this);
+        root.setLayoutDirection(rtl ? View.LAYOUT_DIRECTION_RTL : View.LAYOUT_DIRECTION_LTR);
+        int start = rtl ? Gravity.RIGHT : Gravity.LEFT;
+        info.setGravity(start);
+        notes.setGravity(start);
+        langButton.setText(I18n.current(this).toUpperCase(Locale.ROOT));
+
         boolean on = StreamService.running;
-        button.setText(on ? "■  Yayını durdur" : "▶  Yayını başlat");
+        button.setText(t(on ? "stop" : "start"));
+
         StringBuilder s = new StringBuilder();
-        if (StreamService.lastError != null) s.append("⚠ ").append(StreamService.lastError).append("\n\n");
+        if (StreamService.lastError != null) {
+            s.append("⚠ ").append(t(StreamService.lastError));
+            if (StreamService.lastErrorDetail != null) s.append(StreamService.lastErrorDetail);
+            s.append("\n\n");
+        }
+        links.removeAllViews();
         if (on) {
-            s.append("Tesla tarayıcısında şu adreslerden birini açın:\n\n");
-            List<String> ips = ipv4();
-            if (ips.isEmpty()) s.append("(Ağ adresi bulunamadı — hotspot açık mı?)\n");
-            for (String ip : ips) {
-                String[] p = ip.split(" ");
-                s.append("http://").append(p[0]).append(':').append(StreamService.PORT)
-                 .append("   (").append(p[1]).append(")\n");
+            s.append(t("open_in_tesla"));
+            List<String[]> ips = ipv4();
+            if (ips.isEmpty()) {
+                s.append("\n\n").append(t("no_address"));
             }
-            s.append("\nGenelde hotspot adresi 192.168.x.x veya 10.x.x.x ile başlar.");
+            for (String[] ip : ips) links.addView(linkView("http://" + ip[0] + ":" + StreamService.PORT, ip[1]));
+            notes.setText(ips.isEmpty() ? t("hotspot_hint") : t("copy_hint") + "\n" + t("hotspot_hint"));
         } else {
-            s.append("1. Telefonda Wi-Fi hotspot'u açın.\n")
-             .append("2. Tesla'yı bu hotspot'a bağlayın (Kontroller > Wi-Fi).\n")
-             .append("3. \"Yayını başlat\"a basın, \"Tüm ekran\"ı seçin.\n")
-             .append("4. Görünen adresi Tesla tarayıcısında açıp ▶ Başlat'a dokunun.\n\n")
-             .append("Notlar:\n• Yayın sırasında telefon ekranı açık tutulur; telefonu kilitlerseniz yayın durur.\n")
-             .append("• Netflix gibi korumalı (DRM) uygulamalar siyah ekran/sessiz görünür.\n")
-             .append("• Tesla sürüşte tarayıcı videosunu gizleyebilir; ses devam eder.");
+            s.append(t("step1")).append('\n').append(t("step2")).append('\n')
+             .append(t("step3")).append('\n').append(t("step4"));
+            notes.setText(t("notes_title") + "\n" + t("note_lock") + "\n" + t("note_drm") + "\n" + t("note_drive"));
         }
         info.setText(s.toString());
+    }
+
+    /** Blue, underlined address; long-press shows a "Copy" menu next to it. */
+    private View linkView(String url, String iface) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        row.setPadding(0, dp(8), 0, dp(8));
+
+        TextView link = new TextView(this);
+        link.setText(url);
+        link.setTextSize(20);
+        link.setTextColor(LINK_BLUE);
+        link.setPaintFlags(link.getPaintFlags() | Paint.UNDERLINE_TEXT_FLAG);
+        link.setTextDirection(View.TEXT_DIRECTION_LTR);
+        link.setPadding(0, dp(4), 0, dp(4));
+        link.setOnLongClickListener(v -> {
+            PopupMenu m = new PopupMenu(this, v, Gravity.END);
+            m.getMenu().add(t("copy"));
+            m.setOnMenuItemClickListener(item -> {
+                ClipboardManager cm = getSystemService(ClipboardManager.class);
+                cm.setPrimaryClip(ClipData.newPlainText("TeslaMirror", url));
+                // Android 13+ shows its own clipboard confirmation.
+                if (Build.VERSION.SDK_INT < 33) Toast.makeText(this, t("copied"), Toast.LENGTH_SHORT).show();
+                return true;
+            });
+            m.show();
+            return true;
+        });
+        row.addView(link);
+
+        TextView label = new TextView(this);
+        label.setText(iface);
+        label.setTextSize(13);
+        label.setTextColor(Color.rgb(150, 150, 150));
+        row.addView(label);
+        return row;
     }
 
     private void requestPermsThenCapture() {
@@ -139,15 +252,16 @@ public class MainActivity extends Activity {
         super.onRequestPermissionsResult(code, perms, results);
         if (code != REQ_PERMS) return;
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
-            Toast.makeText(this, "Ses izni verilmedi: yalnızca görüntü aktarılacak", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, t("toast_no_audio"), Toast.LENGTH_LONG).show();
         if (Build.VERSION.SDK_INT >= 33
                 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
-            Toast.makeText(this, "Bildirim izni yok: yayını durdurmak için uygulamaya dönün", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, t("toast_no_notif"), Toast.LENGTH_LONG).show();
         launchCapture();
     }
 
     private void launchCapture() {
         MediaProjectionManager mpm = getSystemService(MediaProjectionManager.class);
+        // Entire screen only: the system dialog's "single app" choice is disabled by this config.
         Intent i = Build.VERSION.SDK_INT >= 34
                 ? mpm.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
                 : mpm.createScreenCaptureIntent();
@@ -159,7 +273,7 @@ public class MainActivity extends Activity {
         super.onActivityResult(req, result, data);
         if (req != REQ_CAPTURE) return;
         if (result != RESULT_OK || data == null) {
-            Toast.makeText(this, "Ekran yakalama izni verilmedi", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, t("toast_capture_denied"), Toast.LENGTH_SHORT).show();
             return;
         }
         Intent s = new Intent(this, StreamService.class)
@@ -168,8 +282,9 @@ public class MainActivity extends Activity {
         startForegroundService(s);
     }
 
-    private static List<String> ipv4() {
-        List<String> r = new ArrayList<>();
+    /** {ip, interface label}; hotspot interfaces first. */
+    private static List<String[]> ipv4() {
+        List<String[]> r = new ArrayList<>();
         try {
             for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
                 if (!ni.isUp() || ni.isLoopback()) continue;
@@ -177,7 +292,7 @@ public class MainActivity extends Activity {
                     if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
                         String n = ni.getName();
                         boolean hotspot = n.startsWith("swlan") || n.startsWith("ap") || n.startsWith("softap") || n.equals("wlan1");
-                        String entry = a.getHostAddress() + " " + n + (hotspot ? "·hotspot" : "");
+                        String[] entry = {a.getHostAddress(), n + (hotspot ? " · hotspot" : "")};
                         if (hotspot) r.add(0, entry); else r.add(entry);
                     }
                 }

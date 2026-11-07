@@ -12,6 +12,7 @@
 
     <application
         android:allowBackup="false"
+        android:supportsRtl="true"
         android:icon="@android:drawable/ic_menu_upload"
         android:label="TeslaMirror"
         android:theme="@android:style/Theme.DeviceDefault">

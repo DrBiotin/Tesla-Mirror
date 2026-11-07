@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="tr">
+<html lang="__LANG__">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -18,10 +18,10 @@
 <body>
 <video id="v" playsinline muted></video>
 <audio id="a"></audio>
-<button id="fs" title="Tam ekran">⛶</button>
+<button id="fs">⛶</button>
 <div id="ov">
-  <button id="go">▶ Başlat</button>
-  <div id="msg">Telefonda TeslaMirror yayını açık olmalı. Ses için bu düğmeye dokunmak gerekir.</div>
+  <button id="go"></button>
+  <div id="msg"></div>
 </div>
 <div id="st"></div>
 <script>
@@ -37,7 +37,29 @@
   const LIVE_TARGET = 0.12, MAX_LAG = 0.8;
   let ws = null, tracks = null, gen = 0, started = false, fatal = false;
 
-  const status = (t) => { st.textContent = t || ''; };
+  // Texts follow the phone app's language (initial value injected by the server, live updates via WebSocket).
+  const L = {
+    tr: { start: '▶ Başlat', msg: 'Telefonda TeslaMirror yayını açık olmalı. Ses için bu düğmeye dokunmak gerekir.', noMse: 'Bu tarayıcı MediaSource desteklemiyor.', connecting: 'Bağlanıyor…', lost: 'Bağlantı koptu, yeniden deneniyor…', unsupported: 'Bu tarayıcı yayın biçimini desteklemiyor: ', noAudio: 'Ses yok (telefonda ses izni verilmedi)', playErr: 'Oynatma hatası, yeniden bağlanılıyor…', fullscreen: 'Tam ekran' },
+    en: { start: '▶ Start', msg: 'TeslaMirror must be streaming on the phone. Tap this button to enable sound.', noMse: 'This browser does not support MediaSource.', connecting: 'Connecting…', lost: 'Connection lost, retrying…', unsupported: 'This browser does not support the stream format: ', noAudio: 'No audio (audio permission not granted on the phone)', playErr: 'Playback error, reconnecting…', fullscreen: 'Full screen' },
+    de: { start: '▶ Start', msg: 'TeslaMirror muss auf dem Telefon übertragen. Tippen Sie auf diese Schaltfläche, um den Ton zu aktivieren.', noMse: 'Dieser Browser unterstützt MediaSource nicht.', connecting: 'Verbinde…', lost: 'Verbindung unterbrochen, neuer Versuch…', unsupported: 'Dieser Browser unterstützt das Streamformat nicht: ', noAudio: 'Kein Ton (Audio-Berechtigung auf dem Telefon nicht erteilt)', playErr: 'Wiedergabefehler, verbinde neu…', fullscreen: 'Vollbild' },
+    fr: { start: '▶ Démarrer', msg: 'TeslaMirror doit diffuser sur le téléphone. Appuyez sur ce bouton pour activer le son.', noMse: 'Ce navigateur ne prend pas en charge MediaSource.', connecting: 'Connexion…', lost: 'Connexion perdue, nouvelle tentative…', unsupported: 'Ce navigateur ne prend pas en charge le format du flux : ', noAudio: 'Pas de son (autorisation audio non accordée sur le téléphone)', playErr: 'Erreur de lecture, reconnexion…', fullscreen: 'Plein écran' },
+    es: { start: '▶ Iniciar', msg: 'TeslaMirror debe estar transmitiendo en el teléfono. Pulse este botón para activar el sonido.', noMse: 'Este navegador no es compatible con MediaSource.', connecting: 'Conectando…', lost: 'Conexión perdida, reintentando…', unsupported: 'Este navegador no admite el formato de la transmisión: ', noAudio: 'Sin audio (no se concedió el permiso de audio en el teléfono)', playErr: 'Error de reproducción, reconectando…', fullscreen: 'Pantalla completa' },
+    ar: { start: '▶ ابدأ', msg: 'يجب أن يكون TeslaMirror يبث على الهاتف. اضغط على هذا الزر لتفعيل الصوت.', noMse: 'هذا المتصفح لا يدعم MediaSource.', connecting: 'جارٍ الاتصال…', lost: 'انقطع الاتصال، جارٍ إعادة المحاولة…', unsupported: 'هذا المتصفح لا يدعم تنسيق البث: ', noAudio: 'لا يوجد صوت (لم يُمنح إذن الصوت على الهاتف)', playErr: 'خطأ في التشغيل، جارٍ إعادة الاتصال…', fullscreen: 'ملء الشاشة' },
+  };
+  let lang = L[document.documentElement.lang] ? document.documentElement.lang : 'en';
+  let stKey = '', stExtra = '';
+  const tr = (k) => (L[lang] && L[lang][k]) || L.en[k] || '';
+  const status = (k, extra) => { stKey = k || ''; stExtra = extra || ''; st.textContent = stKey ? tr(stKey) + stExtra : ''; };
+  function applyLang(code) {
+    if (L[code]) lang = code;
+    document.documentElement.lang = lang;
+    document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
+    document.getElementById('go').textContent = tr('start');
+    if (!msg.dataset.err) msg.textContent = tr('msg');
+    document.getElementById('fs').title = tr('fullscreen');
+    st.textContent = stKey ? tr(stKey) + stExtra : '';
+  }
+  applyLang(lang);
 
   function makeTrack(el, mime, myGen) {
     const t = { el, sb: null, q: [], ms: new MediaSource() };
@@ -51,7 +73,7 @@
       } catch (e) {
         fatal = true;
         tracks = null;
-        status('Bu tarayıcı yayın biçimini desteklemiyor: ' + mime);
+        status('unsupported', mime);
         try { ws.close(); } catch (_) {}
         return;
       }
@@ -68,7 +90,7 @@
       a: cfg.a ? makeTrack(au, 'audio/mp4; codecs="' + cfg.a + '"', myGen) : null,
     };
     if (!cfg.a) { au.removeAttribute('src'); au.load(); }
-    status(cfg.a ? '' : 'Ses yok (telefonda ses izni verilmedi)');
+    status(cfg.a ? '' : 'noAudio');
   }
 
   function isCurrent(t) { return tracks && (t === tracks.v || t === tracks.a); }
@@ -83,7 +105,7 @@
         if (!trimTrack(t, 1)) t.q.length = 0;   // nothing removable: drop backlog
       } else {
         // Decoder/buffer got into a bad state: reconnect, the server resends config + keyframe.
-        status('Oynatma hatası, yeniden bağlanılıyor…');
+        status('playErr');
         tracks = null;
         try { ws.close(); } catch (_) {}
       }
@@ -98,13 +120,14 @@
 
   function connect() {
     if (fatal) return;
-    status('Bağlanıyor…');
+    status('connecting');
     ws = new WebSocket('ws://' + location.host + '/ws');
     ws.binaryType = 'arraybuffer';
     ws.onmessage = (e) => {
       if (typeof e.data === 'string') {
         let m; try { m = JSON.parse(e.data); } catch (_) { return; }
         if (m.type === 'config') build(m);
+        else if (m.type === 'lang') applyLang(m.lang);
         return;
       }
       if (!tracks) return;
@@ -119,7 +142,7 @@
     ws.onclose = () => {
       tracks = null;
       if (fatal) return;
-      status('Bağlantı koptu, yeniden deneniyor…');
+      status('lost');
       setTimeout(connect, 1500);
     };
     ws.onerror = () => { try { ws.close(); } catch (_) {} };
@@ -179,7 +202,7 @@
   }
 
   document.getElementById('go').onclick = () => {
-    if (!window.MediaSource) { msg.textContent = 'Bu tarayıcı MediaSource desteklemiyor.'; return; }
+    if (!window.MediaSource) { msg.dataset.err = '1'; msg.textContent = tr('noMse'); return; }
     ov.classList.add('hide');
     au.muted = false;
     au.play().catch(() => {});   // unlock audio inside the user gesture

@@ -43,6 +43,15 @@ final class StreamServer {
     private String videoCodec, audioCodec;
     private byte[] videoInitFrame, audioInitFrame;
     private boolean audioExpected = true;
+    private volatile String lang = "en";
+
+    /** Language of the Tesla page; pushed live to connected pages. */
+    synchronized void setLang(String code) {
+        if (code == null || !code.matches("[a-z]{2}")) return;
+        lang = code;
+        byte[] f = frame(0x1, ("{\"type\":\"lang\",\"lang\":\"" + code + "\"}").getBytes(StandardCharsets.UTF_8));
+        for (Client c : clients) c.queue.offer(f);
+    }
 
     StreamServer(int port, byte[] page, KeyFrameRequester keyReq) {
         this.port = port;
@@ -130,6 +139,7 @@ final class StreamServer {
         c.queue.clear();
         String json = "{\"type\":\"config\",\"v\":\"" + videoCodec + "\",\"a\":"
                 + (audioInitFrame != null ? "\"" + audioCodec + "\"" : "null") + "}";
+        c.queue.offer(frame(0x1, ("{\"type\":\"lang\",\"lang\":\"" + lang + "\"}").getBytes(StandardCharsets.UTF_8)));
         c.queue.offer(frame(0x1, json.getBytes(StandardCharsets.UTF_8)));
         c.queue.offer(videoInitFrame);
         if (audioInitFrame != null) c.queue.offer(audioInitFrame);
@@ -237,7 +247,9 @@ final class StreamServer {
                 return;
             }
             if (path.equals("/") || path.startsWith("/?") || path.startsWith("/index.html")) {
-                respond(out, "200 OK", "text/html; charset=utf-8", page);
+                byte[] body = new String(page, StandardCharsets.UTF_8).replace("__LANG__", lang)
+                        .getBytes(StandardCharsets.UTF_8);
+                respond(out, "200 OK", "text/html; charset=utf-8", body);
             } else {
                 respond(out, "404 Not Found", "text/plain", "Not found".getBytes(StandardCharsets.US_ASCII));
             }

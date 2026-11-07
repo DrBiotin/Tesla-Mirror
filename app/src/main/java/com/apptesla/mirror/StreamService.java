@@ -35,7 +35,9 @@ public class StreamService extends Service {
 
     interface StatusListener { void onStatusChanged(); }
     static volatile boolean running;
-    static volatile String lastError;
+    /** Last error as a translation key (+ optional raw detail), rendered in the current language. */
+    static volatile String lastError, lastErrorDetail;
+    private static volatile StreamService instance;
     static volatile StatusListener listener;
 
     private HandlerThread thread;
@@ -74,7 +76,7 @@ public class StreamService extends Service {
         if (running) {
             // Same live instance: ignore. New instance while the old one is still closing: bail out.
             if (projection == null) {
-                lastError = "Önceki yayın kapanıyor, birkaç saniye sonra tekrar deneyin.";
+                lastError = "err_busy"; lastErrorDetail = null;
                 notifyStatus();
                 stopSelf();
             }
@@ -88,7 +90,7 @@ public class StreamService extends Service {
         MediaProjectionManager mpm = getSystemService(MediaProjectionManager.class);
         projection = data == null ? null : mpm.getMediaProjection(code, data);
         if (projection == null) {
-            fail("Ekran yakalama izni alınamadı");
+            fail("err_capture", null);
             return START_NOT_STICKY;
         }
 
@@ -99,7 +101,7 @@ public class StreamService extends Service {
         projection.registerCallback(new MediaProjection.Callback() {
             @Override public void onStop() {
                 // Android 15 QPR1+ ends screen sharing when the phone locks.
-                if (!stopping) lastError = "Paylaşım sistem tarafından durduruldu (telefon kilitlenmiş olabilir).";
+                if (!stopping) { lastError = "err_lock"; lastErrorDetail = null; }
                 handler.post(StreamService.this::stopSelf);
             }
         }, handler);
@@ -109,6 +111,8 @@ public class StreamService extends Service {
         running = true;
         owner = true;
         lastError = null;
+        lastErrorDetail = null;
+        instance = this;
         notifyStatus();
         handler.post(this::startPipeline);
         return START_NOT_STICKY;
@@ -121,6 +125,7 @@ public class StreamService extends Service {
                 VideoEncoder v = video;
                 if (v != null) v.requestKeyFrame();
             });
+            srv.setLang(I18n.current(this));
             server = srv;
             srv.start();
 
@@ -153,7 +158,7 @@ public class StreamService extends Service {
             dm.registerDisplayListener(displayListener, handler);
         } catch (Exception e) {
             Log.e(TAG, "start failed", e);
-            fail("Başlatılamadı: " + e.getMessage());
+            fail("err_start", e.getMessage());
         }
     }
 
@@ -204,12 +209,13 @@ public class StreamService extends Service {
             startVideo();
         } catch (Exception e) {
             Log.e(TAG, "rotation restart failed", e);
-            fail("Döndürme sonrası video yeniden başlatılamadı");
+            fail("err_rotation", null);
         }
     }
 
-    private void fail(String msg) {
-        lastError = msg;
+    private void fail(String key, String detail) {
+        lastError = key;
+        lastErrorDetail = detail;
         notifyStatus();
         stopSelf();
     }
@@ -225,8 +231,19 @@ public class StreamService extends Service {
         }
     }
 
+    /** Called by the UI when the user picks another language. */
+    static void onLanguageChanged() {
+        StreamService s = instance;
+        if (s == null || s.stopping) return;
+        s.createChannel();
+        s.getSystemService(NotificationManager.class).notify(1, s.buildNotification());
+        StreamServer srv = s.server;
+        if (srv != null) srv.setLang(I18n.current(s));
+    }
+
     @Override
     public void onDestroy() {
+        if (instance == this) instance = null;
         stopping = true;
         try { if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); } catch (Exception ignored) {}
         if (handler != null) {
@@ -261,7 +278,7 @@ public class StreamService extends Service {
     }
 
     private void createChannel() {
-        NotificationChannel ch = new NotificationChannel(CHANNEL, "Ekran yansıtma", NotificationManager.IMPORTANCE_LOW);
+        NotificationChannel ch = new NotificationChannel(CHANNEL, I18n.t(this, "notif_channel"), NotificationManager.IMPORTANCE_LOW);
         getSystemService(NotificationManager.class).createNotificationChannel(ch);
     }
 
@@ -272,10 +289,10 @@ public class StreamService extends Service {
                 new Intent(this, StreamService.class).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE);
         return new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_menu_upload)
-                .setContentTitle("TeslaMirror yayında")
-                .setContentText("Tesla tarayıcısında uygulamadaki adresi açın")
+                .setContentTitle(I18n.t(this, "notif_title"))
+                .setContentText(I18n.t(this, "notif_text"))
                 .setContentIntent(open)
-                .addAction(new Notification.Action.Builder(null, "Durdur", stop).build())
+                .addAction(new Notification.Action.Builder(null, I18n.t(this, "notif_stop"), stop).build())
                 .setOngoing(true)
                 .build();
     }
