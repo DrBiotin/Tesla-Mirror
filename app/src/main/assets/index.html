@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tesla Mirror</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#fff}
+  video{position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+  #ov{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;background:rgba(0,0,0,.88);z-index:2}
+  #ov.hide{display:none}
+  #go{font-size:30px;padding:20px 56px;border:0;border-radius:16px;background:#e82127;color:#fff;cursor:pointer}
+  #msg{font-size:18px;opacity:.75;text-align:center;max-width:80vw}
+  #st{position:fixed;left:14px;bottom:12px;font-size:14px;opacity:.55;z-index:3;pointer-events:none}
+  #fs{position:fixed;right:14px;top:12px;z-index:3;font-size:16px;padding:8px 14px;border:0;border-radius:10px;background:rgba(255,255,255,.12);color:#fff;opacity:.5}
+</style>
+</head>
+<body>
+<video id="v" playsinline></video>
+<button id="fs" title="Tam ekran">⛶</button>
+<div id="ov">
+  <button id="go">▶ Başlat</button>
+  <div id="msg">Telefonda TeslaMirror yayını açık olmalı. Ses için bu düğmeye dokunmak gerekir.</div>
+</div>
+<div id="st"></div>
+<script>
+(() => {
+  'use strict';
+  const v = document.getElementById('v');
+  const ov = document.getElementById('ov');
+  const msg = document.getElementById('msg');
+  const st = document.getElementById('st');
+  let ws = null, ms = null, bufs = null, gen = 0, started = false;
+
+  const status = (t) => { st.textContent = t || ''; };
+
+  function build(cfg) {
+    const myGen = ++gen;
+    bufs = { v: { sb: null, q: [] }, a: cfg.a ? { sb: null, q: [] } : null };
+    const mine = bufs;
+    ms = new MediaSource();
+    const url = URL.createObjectURL(ms);
+    v.src = url;
+    ms.addEventListener('sourceopen', () => {
+      if (myGen !== gen) return;
+      URL.revokeObjectURL(url);
+      try {
+        mine.v.sb = ms.addSourceBuffer('video/mp4; codecs="' + cfg.v + '"');
+        if (mine.a) mine.a.sb = ms.addSourceBuffer('audio/mp4; codecs="' + cfg.a + '"');
+      } catch (e) {
+        status('Codec desteklenmiyor: ' + e.message);
+        return;
+      }
+      for (const b of [mine.v, mine.a]) {
+        if (!b) continue;
+        b.sb.addEventListener('updateend', () => pump(b));
+        pump(b);
+      }
+      status(cfg.a ? '' : 'Ses yok (telefonda mikrofon/ses izni verilmedi)');
+    }, { once: true });
+  }
+
+  function pump(b) {
+    if (!b.sb || b.sb.updating || !b.q.length || !ms || ms.readyState !== 'open') return;
+    try {
+      b.sb.appendBuffer(b.q.shift());
+    } catch (e) {
+      if (e.name === 'QuotaExceededError') trim(2);
+      else status('Oynatma hatası: ' + e.message);
+    }
+  }
+
+  function trim(keepSec) {
+    if (!bufs) return;
+    const upto = v.currentTime - keepSec;
+    if (upto <= 0) return;
+    for (const b of [bufs.v, bufs.a]) {
+      if (b && b.sb && !b.sb.updating && b.sb.buffered.length && b.sb.buffered.start(0) < upto) {
+        try { b.sb.remove(0, upto); } catch (_) {}
+      }
+    }
+  }
+
+  function connect() {
+    status('Bağlanıyor…');
+    ws = new WebSocket('ws://' + location.host + '/ws');
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = (e) => {
+      if (typeof e.data === 'string') {
+        let m; try { m = JSON.parse(e.data); } catch (_) { return; }
+        if (m.type === 'config') build(m);
+        return;
+      }
+      if (!bufs) return;
+      const d = new Uint8Array(e.data);
+      const t = d[0];
+      const b = (t === 1 || t === 2) ? bufs.v : (t === 3 || t === 4) ? bufs.a : null;
+      if (!b) return;
+      b.q.push(d.subarray(1));
+      pump(b);
+    };
+    ws.onclose = () => {
+      status('Bağlantı koptu, yeniden deneniyor…');
+      bufs = null;
+      setTimeout(connect, 1500);
+    };
+    ws.onerror = () => { try { ws.close(); } catch (_) {} };
+  }
+
+  // Keep playback at the live edge with low latency.
+  setInterval(() => {
+    if (!bufs || !bufs.v.sb) return;
+    const r = v.buffered;
+    if (!r.length) return;
+    const start = r.start(r.length - 1), end = r.end(r.length - 1);
+    const lag = end - v.currentTime;
+    if (v.currentTime < start || lag > 0.8) {
+      v.currentTime = Math.max(start, end - 0.12);
+    } else {
+      v.playbackRate = lag > 0.3 ? 1.08 : 1.0;
+    }
+    if (v.paused && end - start > 0.05) v.play().catch(() => {});
+    if (v.currentTime - r.start(0) > 20) trim(8);
+  }, 250);
+
+  function fullscreen() {
+    const el = document.documentElement;
+    const f = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (f) { try { const p = f.call(el); if (p && p.catch) p.catch(() => {}); } catch (_) {} }
+  }
+
+  document.getElementById('go').onclick = () => {
+    if (!window.MediaSource) { msg.textContent = 'Bu tarayıcı MediaSource desteklemiyor.'; return; }
+    ov.classList.add('hide');
+    v.muted = false;
+    fullscreen();
+    if (!started) { started = true; connect(); }
+  };
+  document.getElementById('fs').onclick = fullscreen;
+})();
+</script>
+</body>
+</html>
