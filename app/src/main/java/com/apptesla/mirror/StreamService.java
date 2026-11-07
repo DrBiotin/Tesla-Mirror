@@ -88,7 +88,12 @@ public class StreamService extends Service {
         if (Build.VERSION.SDK_INT >= 33) data = intent.getParcelableExtra(EXTRA_DATA, Intent.class);
         else data = intent.getParcelableExtra(EXTRA_DATA);
         MediaProjectionManager mpm = getSystemService(MediaProjectionManager.class);
-        projection = data == null ? null : mpm.getMediaProjection(code, data);
+        try {
+            projection = data == null ? null : mpm.getMediaProjection(code, data);
+        } catch (RuntimeException e) {   // e.g. SecurityException for an invalid/reused token
+            Log.e(TAG, "getMediaProjection failed", e);
+            projection = null;
+        }
         if (projection == null) {
             fail("err_capture", null);
             return START_NOT_STICKY;
@@ -137,6 +142,7 @@ public class StreamService extends Service {
                     audio = new AudioEncoder(projection, t0Us, new AudioEncoder.Sink() {
                         @Override public void onAudioInit(byte[] init, String codec) { srv.setAudioInit(init, codec); }
                         @Override public void onAudioFragment(byte[] f) { srv.sendAudio(f); }
+                        @Override public void onAudioFailed() { handler.post(StreamService.this::dropAudio); }
                     });
                     audio.start();
                     audioOk = true;
@@ -146,6 +152,9 @@ public class StreamService extends Service {
                 }
             }
             if (!audioOk) srv.setAudioExpected(false);
+            else handler.postDelayed(() -> {   // no AAC config within 5 s: continue video-only
+                if (!stopping && server == srv && !srv.hasAudioInit()) dropAudio();
+            }, 5000);
 
             DisplayManager dm = getSystemService(DisplayManager.class);
             displayListener = new DisplayManager.DisplayListener() {
@@ -160,6 +169,16 @@ public class StreamService extends Service {
             Log.e(TAG, "start failed", e);
             fail("err_start", e.getMessage());
         }
+    }
+
+    /** Audio failed or never started: switch the Tesla page to video-only. */
+    private void dropAudio() {
+        if (stopping) return;
+        StreamServer srv = server;
+        if (srv != null) srv.setAudioExpected(false, "fail");
+        AudioEncoder a = audio;
+        audio = null;
+        if (a != null) a.stop();
     }
 
     private Point screenSize() {

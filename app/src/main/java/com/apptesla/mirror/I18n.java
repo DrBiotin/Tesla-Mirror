@@ -94,7 +94,7 @@ final class I18n {
                 "Audio permission denied: only video will be streamed",
                 "Audio-Berechtigung verweigert: Es wird nur das Bild übertragen",
                 "Autorisation audio refusée : seule l'image sera diffusée",
-                "Permiso de audio denegado: solo se transmitirá la imagen",
+                "Permiso de audio denegado: solo se transmitirá el vídeo",
                 "تم رفض إذن الصوت: سيتم بث الصورة فقط");
         put("toast_no_notif", "Bildirim izni yok: yayını durdurmak için uygulamaya dönün",
                 "No notification permission: return to the app to stop streaming",

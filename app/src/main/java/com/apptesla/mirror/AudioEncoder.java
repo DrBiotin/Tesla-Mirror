@@ -22,6 +22,8 @@ final class AudioEncoder {
     interface Sink {
         void onAudioInit(byte[] init, String codec);
         void onAudioFragment(byte[] fragment);
+        /** Audio thread died while streaming: caller should continue video-only. */
+        void onAudioFailed();
     }
 
     private static final String TAG = "TeslaMirror";
@@ -134,8 +136,16 @@ final class AudioEncoder {
                 if (n <= 0) Thread.sleep(5);
             }
         } catch (Exception e) {
-            if (!stop) Log.e(TAG, "audio feed error", e);
+            if (!stop) { Log.e(TAG, "audio feed error", e); reportFailure(); }
         }
+    }
+
+    private final java.util.concurrent.atomic.AtomicBoolean failed = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Not synchronized: stop() holds the lock while joining these threads. */
+    private void reportFailure() {
+        if (stop || !failed.compareAndSet(false, true)) return;
+        sink.onAudioFailed();
     }
 
     private void queue(byte[] pcm, int off, long ptsUs) {
@@ -194,14 +204,14 @@ final class AudioEncoder {
                     inited = true;
                     continue;
                 }
-                if (!inited) continue;
+                if (!inited || stop) continue;   // stopped encoder must not emit anymore
                 long t = Math.max(0, (pts - t0Us) * RATE / 1_000_000);
                 if (next < 0 || Math.abs(t - next) > RATE / 10) next = t; // resync if >100 ms off
                 sink.onAudioFragment(Fmp4.fragment(seq++, next, 1024, data, Fmp4.FLAGS_SYNC));
                 next += 1024;
             }
         } catch (Exception e) {
-            if (!stop) Log.e(TAG, "audio drain error", e);
+            if (!stop) { Log.e(TAG, "audio drain error", e); reportFailure(); }
         }
     }
 }

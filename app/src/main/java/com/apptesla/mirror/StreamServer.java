@@ -43,6 +43,7 @@ final class StreamServer {
     private String videoCodec, audioCodec;
     private byte[] videoInitFrame, audioInitFrame;
     private boolean audioExpected = true;
+    private String audioOffReason = "perm";
     private volatile String lang = "en";
 
     /** Language of the Tesla page; pushed live to connected pages. */
@@ -87,8 +88,12 @@ final class StreamServer {
     // ---------------- stream state ----------------
 
     /** Call with false if audio capture is unavailable, so clients don't wait for it. */
-    synchronized void setAudioExpected(boolean expected) {
+    synchronized void setAudioExpected(boolean expected) { setAudioExpected(expected, "perm"); }
+
+    /** reason: "perm" (no permission) or "fail" (audio pipeline failed/timed out). */
+    synchronized void setAudioExpected(boolean expected, String reason) {
         audioExpected = expected;
+        audioOffReason = reason;
         if (!expected) { audioCodec = null; audioInitFrame = null; }
         broadcastConfig();
     }
@@ -99,7 +104,10 @@ final class StreamServer {
         broadcastConfig();
     }
 
+    synchronized boolean hasAudioInit() { return audioInitFrame != null; }
+
     synchronized void setAudioInit(byte[] init, String codec) {
+        if (!audioExpected) return; // audio was dropped (failure/timeout)
         audioCodec = codec;
         audioInitFrame = frame(0x2, typed(T_AUDIO_INIT, init));
         broadcastConfig();
@@ -138,7 +146,8 @@ final class StreamServer {
     private void configure(Client c) {
         c.queue.clear();
         String json = "{\"type\":\"config\",\"v\":\"" + videoCodec + "\",\"a\":"
-                + (audioInitFrame != null ? "\"" + audioCodec + "\"" : "null") + "}";
+                + (audioInitFrame != null ? "\"" + audioCodec + "\"" : "null")
+                + ",\"ar\":\"" + audioOffReason + "\"}";
         c.queue.offer(frame(0x1, ("{\"type\":\"lang\",\"lang\":\"" + lang + "\"}").getBytes(StandardCharsets.UTF_8)));
         c.queue.offer(frame(0x1, json.getBytes(StandardCharsets.UTF_8)));
         c.queue.offer(videoInitFrame);
@@ -259,18 +268,39 @@ final class StreamServer {
         }
     }
 
-    /** Host header must be a literal IP (optionally with port), never a domain name. */
+    /** Host header must be a literal IP (optionally with port 1-65535), never a domain name. */
     static boolean isIpHost(String host) {
         if (host == null) return false;
-        String h = host.trim();
+        String h = host.trim(), addr, port = null;
         if (h.startsWith("[")) {                       // [IPv6]:port
             int e = h.indexOf(']');
             if (e < 0) return false;
+            addr = h.substring(1, e);
             String rest = h.substring(e + 1);
-            if (!rest.isEmpty() && !rest.matches(":\\d{1,5}")) return false;
-            return h.substring(1, e).matches("[0-9a-fA-F:.%a-zA-Z0-9]+") && h.substring(1, e).contains(":");
+            if (!rest.isEmpty()) {
+                if (!rest.startsWith(":")) return false;
+                port = rest.substring(1);
+            }
+            // hex/colon/dot only (+ optional %zone); contains ':' so it can never be a DNS name
+            if (!addr.matches("[0-9a-fA-F:.]+(%[A-Za-z0-9_.-]+)?") || !addr.contains(":")) return false;
+            try {
+                String noZone = addr.contains("%") ? addr.substring(0, addr.indexOf('%')) : addr;
+                if (!(InetAddress.getByName(noZone) instanceof Inet6Address)) return false;
+            } catch (Exception ex) {
+                return false;
+            }
+        } else {
+            int c = h.lastIndexOf(':');
+            addr = c >= 0 ? h.substring(0, c) : h;
+            if (c >= 0) port = h.substring(c + 1);
+            if (!addr.matches("(25[0-5]|2[0-4]\\d|1?\\d?\\d)(\\.(25[0-5]|2[0-4]\\d|1?\\d?\\d)){3}")) return false;
         }
-        return h.matches("(25[0-5]|2[0-4]\\d|1?\\d?\\d)(\\.(25[0-5]|2[0-4]\\d|1?\\d?\\d)){3}(:\\d{1,5})?");
+        if (port != null) {
+            if (!port.matches("\\d{1,5}")) return false;
+            int p = Integer.parseInt(port);
+            if (p < 1 || p > 65535) return false;
+        }
+        return true;
     }
 
     /** Private/link-local/loopback only (hotspot clients), IPv4 and IPv6. */
@@ -291,7 +321,9 @@ final class StreamServer {
     private static String readHead(InputStream in) throws IOException {
         ByteArrayOutputStream b = new ByteArrayOutputStream();
         int state = 0;
+        long deadline = System.currentTimeMillis() + 10_000; // total limit, not just per read
         while (b.size() < 16384) {
+            if (System.currentTimeMillis() > deadline) return null;
             int c = in.read();
             if (c < 0) return null;
             b.write(c);
@@ -346,6 +378,7 @@ final class StreamServer {
                 long len = b1 & 0x7F;
                 if (len == 126) len = (rd(in) << 8) | rd(in);
                 else if (len == 127) { len = 0; for (int i = 0; i < 8; i++) len = (len << 8) | rd(in); }
+                if (len < 0 || len > 1_000_000) throw new IOException("frame too large"); // browsers send tiny frames
                 if ((b1 & 0x80) != 0) for (int i = 0; i < 4; i++) rd(in);
                 for (long i = 0; i < len; i++) rd(in);
                 if ((b0 & 0x0F) == 0x8) return; // close

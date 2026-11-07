@@ -139,7 +139,7 @@ final class VideoEncoder {
                 }
                 if (idx < 0) {
                     // Screen went still: don't hold the last frame back, publish it now.
-                    if (pendSample != null && System.nanoTime() - pendArrivalNs > 50_000_000L) {
+                    if (!stop && pendSample != null && System.nanoTime() - pendArrivalNs > 50_000_000L) {
                         long nowT = (System.nanoTime() / 1000 - t0Us) * 9 / 100;
                         int dur = (int) Math.max(3000, Math.min(nowT - pendT, 90_000));
                         sink.onVideoFragment(Fmp4.fragment(seq++, pendT, dur, pendSample,
@@ -187,6 +187,7 @@ final class VideoEncoder {
                 long t = Math.max(0, (pts + offsetUs - t0Us) * 9 / 100); // us -> 90 kHz
                 if (pendSample == null && t <= lastEnd - 3000) t = lastEnd; // never go backwards after an idle flush
 
+                if (stop) break;                 // stopped encoder must not emit anymore
                 if (pendSample != null) {
                     if (t <= pendT) t = pendT + 1;
                     int dur = (int) Math.min(t - pendT, 90_000);
