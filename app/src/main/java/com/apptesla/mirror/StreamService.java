@@ -46,7 +46,7 @@ public class StreamService extends Service {
     private AudioEncoder audio;
     private StreamServer server;
     private DisplayManager.DisplayListener displayListener;
-    private boolean landscape;
+    private int lastW, lastH;
     private long t0Us;
     private boolean stopping;
     private PowerManager.WakeLock wakeLock;
@@ -173,7 +173,8 @@ public class StreamService extends Service {
 
     private void startVideo() throws Exception {
         Point s = screenSize();
-        landscape = s.x > s.y;
+        lastW = s.x;
+        lastH = s.y;
         final StreamServer srv = server;
         VideoEncoder v = VideoEncoder.create(s.x, s.y, t0Us, new VideoEncoder.Sink() {
             @Override public void onVideoInit(byte[] init, String codec) { srv.setVideoInit(init, codec); }
@@ -190,11 +191,11 @@ public class StreamService extends Service {
         v.start();
     }
 
-    /** Phone rotated (e.g. full-screen video): rebuild encoder at the new orientation. */
+    /** Phone rotated or (foldable) screen size changed: rebuild encoder at the new size. */
     private void checkRotation() {
         if (stopping || video == null) return;
         Point s = screenSize();
-        if ((s.x > s.y) == landscape) return;
+        if (s.x == lastW && s.y == lastH) return;
         try {
             display.setSurface(null);
             VideoEncoder old = video;

@@ -82,7 +82,10 @@
       if (e.name === 'QuotaExceededError') {
         if (!trimTrack(t, 1)) t.q.length = 0;   // nothing removable: drop backlog
       } else {
-        status('Oynatma hatası: ' + e.message);
+        // Decoder/buffer got into a bad state: reconnect, the server resends config + keyframe.
+        status('Oynatma hatası, yeniden bağlanılıyor…');
+        tracks = null;
+        try { ws.close(); } catch (_) {}
       }
     }
   }

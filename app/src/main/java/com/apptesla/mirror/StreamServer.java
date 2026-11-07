@@ -147,8 +147,9 @@ final class StreamServer {
     }
 
     private synchronized void join(Client c) {
-        if (!running) { c.close(); return; }
+        if (!running || !c.open) { c.close(); return; }
         clients.add(c);
+        if (!c.open) { clients.remove(c); return; } // closed while registering
         if (ready()) { configure(c); keyReq.requestKeyFrame(); }
     }
 
@@ -210,8 +211,14 @@ final class StreamServer {
                 int c = lines[i].indexOf(':');
                 if (c > 0) hdr.put(lines[i].substring(0, c).trim().toLowerCase(Locale.ROOT), lines[i].substring(c + 1).trim());
             }
+            String host = hdr.get("host");
+            if (!isIpHost(host)) { // DNS-rebinding guard: only http://<IP>:port is served
+                respond(out, "403 Forbidden", "text/plain", "Forbidden".getBytes(StandardCharsets.US_ASCII));
+                s.close();
+                return;
+            }
             if (path.startsWith("/ws") && "websocket".equalsIgnoreCase(hdr.get("upgrade")) && hdr.containsKey("sec-websocket-key")) {
-                String origin = hdr.get("origin"), host = hdr.get("host");
+                String origin = hdr.get("origin");
                 if (origin != null && !origin.equals("http://" + host)) { // other web pages may not connect
                     respond(out, "403 Forbidden", "text/plain", "Forbidden".getBytes(StandardCharsets.US_ASCII));
                     s.close();
@@ -238,6 +245,20 @@ final class StreamServer {
         } catch (Exception e) {
             try { s.close(); } catch (IOException ignored) {}
         }
+    }
+
+    /** Host header must be a literal IP (optionally with port), never a domain name. */
+    static boolean isIpHost(String host) {
+        if (host == null) return false;
+        String h = host.trim();
+        if (h.startsWith("[")) {                       // [IPv6]:port
+            int e = h.indexOf(']');
+            if (e < 0) return false;
+            String rest = h.substring(e + 1);
+            if (!rest.isEmpty() && !rest.matches(":\\d{1,5}")) return false;
+            return h.substring(1, e).matches("[0-9a-fA-F:.%a-zA-Z0-9]+") && h.substring(1, e).contains(":");
+        }
+        return h.matches("(25[0-5]|2[0-4]\\d|1?\\d?\\d)(\\.(25[0-5]|2[0-4]\\d|1?\\d?\\d)){3}(:\\d{1,5})?");
     }
 
     /** Private/link-local/loopback only (hotspot clients), IPv4 and IPv6. */

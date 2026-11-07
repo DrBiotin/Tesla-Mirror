@@ -140,6 +140,9 @@ public class MainActivity extends Activity {
         if (code != REQ_PERMS) return;
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
             Toast.makeText(this, "Ses izni verilmedi: yalnızca görüntü aktarılacak", Toast.LENGTH_LONG).show();
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+            Toast.makeText(this, "Bildirim izni yok: yayını durdurmak için uygulamaya dönün", Toast.LENGTH_LONG).show();
         launchCapture();
     }
 

@@ -81,16 +81,28 @@ final class AudioEncoder {
         }
     }
 
+    /** On failure everything is released and the exception is rethrown (caller drops audio). */
     void start() {
-        rec.startRecording();
-        codec.start();
-        inThread = new Thread(this::feed, "audio-in");
-        outThread = new Thread(this::drain, "audio-out");
-        inThread.start();
-        outThread.start();
+        try {
+            rec.startRecording();
+            if (rec.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING)
+                throw new IllegalStateException("AudioRecord kayda başlamadı");
+            codec.start();
+            inThread = new Thread(this::feed, "audio-in");
+            outThread = new Thread(this::drain, "audio-out");
+            inThread.start();
+            outThread.start();
+        } catch (RuntimeException e) {
+            stop();
+            throw e;
+        }
     }
 
-    void stop() {
+    private boolean released;
+
+    synchronized void stop() {
+        if (released) return;
+        released = true;
         stop = true;
         try { if (inThread != null) inThread.join(1000); } catch (InterruptedException ignored) {}
         try { if (outThread != null) outThread.join(1000); } catch (InterruptedException ignored) {}
@@ -140,11 +152,27 @@ final class AudioEncoder {
     private void drain() {
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         boolean inited = false;
+        byte[] lastAsc = null;
         long next = -1; // in 48 kHz units
         int seq = 1;
         try {
             while (!stop) {
                 int idx = codec.dequeueOutputBuffer(info, 10_000);
+                if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    // Some encoders deliver the AudioSpecificConfig only as csd-0 in the output format.
+                    MediaFormat of = codec.getOutputFormat();
+                    ByteBuffer c = of.containsKey("csd-0") ? of.getByteBuffer("csd-0") : null;
+                    if (c != null && c.remaining() > 0) {
+                        byte[] asc = new byte[c.remaining()];
+                        c.duplicate().get(asc);
+                        if (!java.util.Arrays.equals(asc, lastAsc)) {
+                            sink.onAudioInit(Fmp4.audioInit(asc, RATE, CHANNELS), "mp4a.40.2");
+                            lastAsc = asc;
+                        }
+                        inited = true;
+                    }
+                    continue;
+                }
                 if (idx < 0) continue;
                 ByteBuffer bb = codec.getOutputBuffer(idx);
                 byte[] data = new byte[info.size];
@@ -159,7 +187,10 @@ final class AudioEncoder {
                 if ((flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
                 if (data.length == 0) continue;
                 if ((flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                    sink.onAudioInit(Fmp4.audioInit(data, RATE, CHANNELS), "mp4a.40.2");
+                    if (!java.util.Arrays.equals(data, lastAsc)) {   // avoid a second identical init
+                        sink.onAudioInit(Fmp4.audioInit(data, RATE, CHANNELS), "mp4a.40.2");
+                        lastAsc = data;
+                    }
                     inited = true;
                     continue;
                 }

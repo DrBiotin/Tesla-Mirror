@@ -46,13 +46,18 @@ final class VideoEncoder {
             int h = ((int) (srcH * scale)) & ~15;
             if (w < 160 || h < 160) continue;
             if (caps != null && !caps.areSizeAndRateSupported(w, h, 30)) continue;
-            try {
-                codec.configure(format(w, h), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-            } catch (Exception e) {
-                Log.w(TAG, "configure failed for " + w + "x" + h, e);
-                codec.reset();
-                continue;
+            boolean ok = false;
+            for (boolean repeat : new boolean[]{true, false}) { // some encoders reject REPEAT_PREVIOUS_FRAME
+                try {
+                    codec.configure(format(w, h, repeat), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                    ok = true;
+                    break;
+                } catch (Exception e) {
+                    Log.w(TAG, "configure failed for " + w + "x" + h + " repeat=" + repeat, e);
+                    codec.reset();
+                }
             }
+            if (!ok) continue;
             try {
                 Log.i(TAG, "video encoder " + codec.getName() + " " + w + "x" + h);
                 return new VideoEncoder(codec, w, h, t0Us, sink);
@@ -65,7 +70,7 @@ final class VideoEncoder {
         throw new IOException("Uygun video kodlayıcı boyutu bulunamadı");
     }
 
-    private static MediaFormat format(int w, int h) {
+    private static MediaFormat format(int w, int h, boolean repeat) {
         MediaFormat f = MediaFormat.createVideoFormat(MIME, w, h);
         f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
         int bitrate = (int) Math.max(2_000_000, Math.min(8_000_000, (long) w * h * 30 / 6));
@@ -73,7 +78,7 @@ final class VideoEncoder {
         f.setInteger(MediaFormat.KEY_FRAME_RATE, 30);
         f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
         // Static screen still produces frames, so the player never starves.
-        f.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000);
+        if (repeat) f.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000);
         f.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
         f.setInteger(MediaFormat.KEY_PRIORITY, 0); // realtime
         return f;
@@ -113,6 +118,25 @@ final class VideoEncoder {
         try {
             while (!stop) {
                 int idx = codec.dequeueOutputBuffer(info, 10_000);
+                if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    // Some encoders deliver SPS/PPS only as csd-0/csd-1 in the output format.
+                    MediaFormat of = codec.getOutputFormat();
+                    for (String k : new String[]{"csd-0", "csd-1"}) {
+                        ByteBuffer c = of.containsKey(k) ? of.getByteBuffer(k) : null;
+                        if (c == null) continue;
+                        byte[] b = new byte[c.remaining()];
+                        c.duplicate().get(b);
+                        for (byte[] n : AnnexB.split(b, 0, b.length)) {
+                            if (AnnexB.type(n) == 7 && sps == null) sps = n;
+                            else if (AnnexB.type(n) == 8 && pps == null) pps = n;
+                        }
+                    }
+                    if (!inited && sps != null && pps != null) {
+                        sink.onVideoInit(Fmp4.videoInit(sps, pps, width, height), Fmp4.videoCodec(sps));
+                        inited = true;
+                    }
+                    continue;
+                }
                 if (idx < 0) {
                     // Screen went still: don't hold the last frame back, publish it now.
                     if (pendSample != null && System.nanoTime() - pendArrivalNs > 50_000_000L) {
