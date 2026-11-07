@@ -16,7 +16,8 @@
 </style>
 </head>
 <body>
-<video id="v" playsinline></video>
+<video id="v" playsinline muted></video>
+<audio id="a"></audio>
 <button id="fs" title="Tam ekran">⛶</button>
 <div id="ov">
   <button id="go">▶ Başlat</button>
@@ -26,62 +27,74 @@
 <script>
 (() => {
   'use strict';
+  // Video and audio play in separate elements: a still screen (no new video frames)
+  // must not stall the sound. Audio is the master clock; video follows it.
   const v = document.getElementById('v');
+  const au = document.getElementById('a');
   const ov = document.getElementById('ov');
   const msg = document.getElementById('msg');
   const st = document.getElementById('st');
-  let ws = null, ms = null, bufs = null, gen = 0, started = false;
+  const LIVE_TARGET = 0.12, MAX_LAG = 0.8;
+  let ws = null, tracks = null, gen = 0, started = false, fatal = false;
 
   const status = (t) => { st.textContent = t || ''; };
 
-  function build(cfg) {
-    const myGen = ++gen;
-    bufs = { v: { sb: null, q: [] }, a: cfg.a ? { sb: null, q: [] } : null };
-    const mine = bufs;
-    ms = new MediaSource();
-    const url = URL.createObjectURL(ms);
-    v.src = url;
-    ms.addEventListener('sourceopen', () => {
-      if (myGen !== gen) return;
+  function makeTrack(el, mime, myGen) {
+    const t = { el, sb: null, q: [], ms: new MediaSource() };
+    const url = URL.createObjectURL(t.ms);
+    el.src = url;
+    t.ms.addEventListener('sourceopen', () => {
       URL.revokeObjectURL(url);
+      if (myGen !== gen) return;
       try {
-        mine.v.sb = ms.addSourceBuffer('video/mp4; codecs="' + cfg.v + '"');
-        if (mine.a) mine.a.sb = ms.addSourceBuffer('audio/mp4; codecs="' + cfg.a + '"');
+        t.sb = t.ms.addSourceBuffer(mime);
       } catch (e) {
-        status('Codec desteklenmiyor: ' + e.message);
+        fatal = true;
+        tracks = null;
+        status('Bu tarayıcı yayın biçimini desteklemiyor: ' + mime);
+        try { ws.close(); } catch (_) {}
         return;
       }
-      for (const b of [mine.v, mine.a]) {
-        if (!b) continue;
-        b.sb.addEventListener('updateend', () => pump(b));
-        pump(b);
-      }
-      status(cfg.a ? '' : 'Ses yok (telefonda mikrofon/ses izni verilmedi)');
+      t.sb.addEventListener('updateend', () => pump(t));
+      pump(t);
     }, { once: true });
+    return t;
   }
 
-  function pump(b) {
-    if (!b.sb || b.sb.updating || !b.q.length || !ms || ms.readyState !== 'open') return;
+  function build(cfg) {
+    const myGen = ++gen;
+    tracks = {
+      v: makeTrack(v, 'video/mp4; codecs="' + cfg.v + '"', myGen),
+      a: cfg.a ? makeTrack(au, 'audio/mp4; codecs="' + cfg.a + '"', myGen) : null,
+    };
+    if (!cfg.a) { au.removeAttribute('src'); au.load(); }
+    status(cfg.a ? '' : 'Ses yok (telefonda ses izni verilmedi)');
+  }
+
+  function isCurrent(t) { return tracks && (t === tracks.v || t === tracks.a); }
+
+  function pump(t) {
+    if (!isCurrent(t) || !t.sb || t.sb.updating || !t.q.length || t.ms.readyState !== 'open') return;
     try {
-      b.sb.appendBuffer(b.q.shift());
+      t.sb.appendBuffer(t.q[0]);
+      t.q.shift();                       // only after a successful append
     } catch (e) {
-      if (e.name === 'QuotaExceededError') trim(2);
-      else status('Oynatma hatası: ' + e.message);
-    }
-  }
-
-  function trim(keepSec) {
-    if (!bufs) return;
-    const upto = v.currentTime - keepSec;
-    if (upto <= 0) return;
-    for (const b of [bufs.v, bufs.a]) {
-      if (b && b.sb && !b.sb.updating && b.sb.buffered.length && b.sb.buffered.start(0) < upto) {
-        try { b.sb.remove(0, upto); } catch (_) {}
+      if (e.name === 'QuotaExceededError') {
+        if (!trimTrack(t, 1)) t.q.length = 0;   // nothing removable: drop backlog
+      } else {
+        status('Oynatma hatası: ' + e.message);
       }
     }
+  }
+
+  function trimTrack(t, keepSec) {
+    const upto = t.el.currentTime - keepSec;
+    if (!t.sb || t.sb.updating || upto <= 0 || !t.sb.buffered.length || t.sb.buffered.start(0) >= upto) return false;
+    try { t.sb.remove(0, upto); return true; } catch (_) { return false; }
   }
 
   function connect() {
+    if (fatal) return;
     status('Bağlanıyor…');
     ws = new WebSocket('ws://' + location.host + '/ws');
     ws.binaryType = 'arraybuffer';
@@ -91,36 +104,69 @@
         if (m.type === 'config') build(m);
         return;
       }
-      if (!bufs) return;
+      if (!tracks) return;
       const d = new Uint8Array(e.data);
-      const t = d[0];
-      const b = (t === 1 || t === 2) ? bufs.v : (t === 3 || t === 4) ? bufs.a : null;
-      if (!b) return;
-      b.q.push(d.subarray(1));
-      pump(b);
+      const k = d[0];
+      const t = (k === 1 || k === 2) ? tracks.v : (k === 3 || k === 4) ? tracks.a : null;
+      if (!t) return;
+      t.q.push(d.subarray(1));
+      if (t.q.length > 600) t.q.length = 0; // runaway safety (e.g. MediaSource never opened)
+      pump(t);
     };
     ws.onclose = () => {
+      tracks = null;
+      if (fatal) return;
       status('Bağlantı koptu, yeniden deneniyor…');
-      bufs = null;
       setTimeout(connect, 1500);
     };
     ws.onerror = () => { try { ws.close(); } catch (_) {} };
   }
 
-  // Keep playback at the live edge with low latency.
-  setInterval(() => {
-    if (!bufs || !bufs.v.sb) return;
-    const r = v.buffered;
-    if (!r.length) return;
-    const start = r.start(r.length - 1), end = r.end(r.length - 1);
-    const lag = end - v.currentTime;
-    if (v.currentTime < start || lag > 0.8) {
-      v.currentTime = Math.max(start, end - 0.12);
-    } else {
-      v.playbackRate = lag > 0.3 ? 1.08 : 1.0;
+  function lastRange(r) { return r.length ? [r.start(r.length - 1), r.end(r.length - 1)] : null; }
+  function inRanges(r, x) { for (let i = 0; i < r.length; i++) if (x >= r.start(i) && x <= r.end(i)) return true; return false; }
+
+  // Master element stays close to the live edge.
+  function chase(el) {
+    const lr = lastRange(el.buffered);
+    if (!lr) return;
+    const [start, end] = lr;
+    const lag = end - el.currentTime;
+    if (el.currentTime < start || lag > MAX_LAG) el.currentTime = Math.max(start, end - LIVE_TARGET);
+    else el.playbackRate = lag > 0.3 ? 1.08 : 1.0;
+    if (el.paused && end - start > 0.05) el.play().catch(() => {});
+  }
+
+  // Video follows the audio clock; on a still screen it just holds the last frame.
+  function follow(target) {
+    const r = v.buffered, lr = lastRange(r);
+    if (!lr) return;
+    const [start, end] = lr;
+    if (target < start) {                      // video is ahead of the sound: hold on its first frame
+      if (v.currentTime !== start) v.currentTime = start;
+      if (!v.paused) v.pause();
+      return;
     }
-    if (v.paused && end - start > 0.05) v.play().catch(() => {});
-    if (v.currentTime - r.start(0) > 20) trim(8);
+    if (inRanges(r, target)) {
+      const diff = target - v.currentTime;     // >0: video behind audio
+      if (Math.abs(diff) > 0.15) { v.currentTime = target; v.playbackRate = au.playbackRate; }
+      else if (Math.abs(diff) > 0.03) v.playbackRate = au.playbackRate * (diff > 0 ? 1.1 : 0.9);
+      else v.playbackRate = au.playbackRate;
+    } else if (target > end) {                 // still screen: keep showing the last frame
+      if (v.currentTime < end - 0.05) v.currentTime = Math.max(start, end - 0.01);
+    }
+    if (v.paused) v.play().catch(() => {});
+  }
+
+  setInterval(() => {
+    if (!tracks || !tracks.v.sb) return;
+    if (tracks.a && tracks.a.sb) {
+      chase(au);
+      follow(au.currentTime);
+      trimTrack(tracks.a, 10);
+    } else {
+      chase(v);
+    }
+    trimTrack(tracks.v, 10);
   }, 250);
 
   function fullscreen() {
@@ -132,7 +178,8 @@
   document.getElementById('go').onclick = () => {
     if (!window.MediaSource) { msg.textContent = 'Bu tarayıcı MediaSource desteklemiyor.'; return; }
     ov.classList.add('hide');
-    v.muted = false;
+    au.muted = false;
+    au.play().catch(() => {});   // unlock audio inside the user gesture
     fullscreen();
     if (!started) { started = true; connect(); }
   };

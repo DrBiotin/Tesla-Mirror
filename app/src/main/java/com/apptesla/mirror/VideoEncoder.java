@@ -45,14 +45,20 @@ final class VideoEncoder {
             int w = ((int) (srcW * scale)) & ~15;
             int h = ((int) (srcH * scale)) & ~15;
             if (w < 160 || h < 160) continue;
-            if (caps != null && !caps.isSizeSupported(w, h)) continue;
+            if (caps != null && !caps.areSizeAndRateSupported(w, h, 30)) continue;
             try {
                 codec.configure(format(w, h), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-                Log.i(TAG, "video encoder " + codec.getName() + " " + w + "x" + h);
-                return new VideoEncoder(codec, w, h, t0Us, sink);
             } catch (Exception e) {
                 Log.w(TAG, "configure failed for " + w + "x" + h, e);
                 codec.reset();
+                continue;
+            }
+            try {
+                Log.i(TAG, "video encoder " + codec.getName() + " " + w + "x" + h);
+                return new VideoEncoder(codec, w, h, t0Us, sink);
+            } catch (Exception e) {          // createInputSurface failed
+                codec.release();
+                throw new IOException("Video kodlayıcı yüzeyi oluşturulamadı", e);
             }
         }
         codec.release();
@@ -103,11 +109,22 @@ final class VideoEncoder {
         boolean inited = false;
         long offsetUs = Long.MIN_VALUE;
         int seq = 1;
-        long pendT = -1; byte[] pendSample = null; boolean pendKey = false;
+        long pendT = -1, lastEnd = 0, pendArrivalNs = 0; byte[] pendSample = null; boolean pendKey = false;
         try {
             while (!stop) {
                 int idx = codec.dequeueOutputBuffer(info, 10_000);
-                if (idx < 0) continue;
+                if (idx < 0) {
+                    // Screen went still: don't hold the last frame back, publish it now.
+                    if (pendSample != null && System.nanoTime() - pendArrivalNs > 50_000_000L) {
+                        long nowT = (System.nanoTime() / 1000 - t0Us) * 9 / 100;
+                        int dur = (int) Math.max(3000, Math.min(nowT - pendT, 90_000));
+                        sink.onVideoFragment(Fmp4.fragment(seq++, pendT, dur, pendSample,
+                                pendKey ? Fmp4.FLAGS_SYNC : Fmp4.FLAGS_NON_SYNC), pendKey);
+                        lastEnd = pendT + dur;
+                        pendSample = null;
+                    }
+                    continue;
+                }
                 ByteBuffer bb = codec.getOutputBuffer(idx);
                 byte[] data = new byte[info.size];
                 if (bb != null && info.size > 0) {
@@ -141,8 +158,10 @@ final class VideoEncoder {
                 if (offsetUs == Long.MIN_VALUE) {
                     long now = System.nanoTime() / 1000;
                     offsetUs = Math.abs(now - pts) > 1_000_000 ? now - pts : 0;
+                    if (offsetUs != 0) Log.w(TAG, "video pts not on monotonic clock, offset " + offsetUs);
                 }
                 long t = Math.max(0, (pts + offsetUs - t0Us) * 9 / 100); // us -> 90 kHz
+                if (pendSample == null && t <= lastEnd - 3000) t = lastEnd; // never go backwards after an idle flush
 
                 if (pendSample != null) {
                     if (t <= pendT) t = pendT + 1;
@@ -150,7 +169,7 @@ final class VideoEncoder {
                     sink.onVideoFragment(Fmp4.fragment(seq++, pendT, dur, pendSample,
                             pendKey ? Fmp4.FLAGS_SYNC : Fmp4.FLAGS_NON_SYNC), pendKey);
                 }
-                pendT = t; pendSample = sample; pendKey = key;
+                pendT = t; pendSample = sample; pendKey = key; pendArrivalNs = System.nanoTime();
             }
         } catch (Exception e) {
             if (!stop) Log.e(TAG, "video drain error", e);

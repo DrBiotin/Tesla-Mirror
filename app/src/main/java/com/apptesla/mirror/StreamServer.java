@@ -4,6 +4,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.Inet6Address;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -28,6 +30,7 @@ final class StreamServer {
 
     static final byte T_VIDEO_INIT = 1, T_VIDEO = 2, T_AUDIO_INIT = 3, T_AUDIO = 4;
     private static final int QUEUE_LIMIT = 240;
+    private static final byte[] PING = frame(0x9, new byte[0]);
 
     private final int port;
     private final byte[] page;
@@ -50,7 +53,12 @@ final class StreamServer {
     void start() throws IOException {
         ServerSocket ss = new ServerSocket();
         ss.setReuseAddress(true);
-        ss.bind(new InetSocketAddress(port));
+        IOException last = null;
+        for (int i = 0; i < 10; i++) {          // previous session may still be releasing the port
+            try { ss.bind(new InetSocketAddress(port)); last = null; break; }
+            catch (IOException e) { last = e; try { Thread.sleep(300); } catch (InterruptedException ignored) {} }
+        }
+        if (last != null) { ss.close(); throw last; }
         server = ss;
         running = true;
         Thread t = new Thread(this::acceptLoop, "ws-accept");
@@ -131,11 +139,15 @@ final class StreamServer {
 
     /** Slow client: drop backlog, restart from next keyframe. */
     private void recover(Client c) {
+        long now = System.currentTimeMillis();
+        if (now - c.lastRecoverMs < 5000) { c.close(); return; } // persistently stuck viewer
+        c.lastRecoverMs = now;
         configure(c);
         keyReq.requestKeyFrame();
     }
 
     private synchronized void join(Client c) {
+        if (!running) { c.close(); return; }
         clients.add(c);
         if (ready()) { configure(c); keyReq.requestKeyFrame(); }
     }
@@ -183,6 +195,7 @@ final class StreamServer {
 
     private void handle(Socket s) {
         try {
+            if (!isLocal(s.getInetAddress())) { s.close(); return; } // never serve the internet side
             s.setTcpNoDelay(true);
             s.setSoTimeout(15000);
             InputStream in = s.getInputStream();
@@ -198,13 +211,19 @@ final class StreamServer {
                 if (c > 0) hdr.put(lines[i].substring(0, c).trim().toLowerCase(Locale.ROOT), lines[i].substring(c + 1).trim());
             }
             if (path.startsWith("/ws") && "websocket".equalsIgnoreCase(hdr.get("upgrade")) && hdr.containsKey("sec-websocket-key")) {
+                String origin = hdr.get("origin"), host = hdr.get("host");
+                if (origin != null && !origin.equals("http://" + host)) { // other web pages may not connect
+                    respond(out, "403 Forbidden", "text/plain", "Forbidden".getBytes(StandardCharsets.US_ASCII));
+                    s.close();
+                    return;
+                }
                 String accept = Base64.getEncoder().encodeToString(MessageDigest.getInstance("SHA-1")
                         .digest((hdr.get("sec-websocket-key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
                                 .getBytes(StandardCharsets.US_ASCII)));
                 out.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                         + "Sec-WebSocket-Accept: " + accept + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
                 out.flush();
-                s.setSoTimeout(0);
+                s.setSoTimeout(15000); // browser answers our pings; silence = dead viewer
                 Client c = new Client(s, in, out);
                 c.startThreads();
                 join(c);
@@ -219,6 +238,14 @@ final class StreamServer {
         } catch (Exception e) {
             try { s.close(); } catch (IOException ignored) {}
         }
+    }
+
+    /** Private/link-local/loopback only (hotspot clients), IPv4 and IPv6. */
+    static boolean isLocal(InetAddress a) {
+        if (a == null) return false;
+        if (a.isLoopbackAddress() || a.isSiteLocalAddress() || a.isLinkLocalAddress()) return true;
+        if (a instanceof Inet6Address) return (a.getAddress()[0] & 0xFE) == 0xFC; // fc00::/7 ULA
+        return false;
     }
 
     private static void respond(OutputStream out, String status, String type, byte[] body) throws IOException {
@@ -246,6 +273,7 @@ final class StreamServer {
         final Socket s; final InputStream in; final OutputStream out;
         final LinkedBlockingQueue<byte[]> queue = new LinkedBlockingQueue<>();
         volatile boolean waitKey = true, configured = false, open = true;
+        long lastRecoverMs;
 
         Client(Socket s, InputStream in, OutputStream out) { this.s = s; this.in = in; this.out = out; }
 
@@ -257,9 +285,12 @@ final class StreamServer {
         void startThreads() {
             Thread w = new Thread(() -> {
                 try {
+                    long lastPing = System.currentTimeMillis();
                     while (open) {
                         byte[] f = queue.poll(500, TimeUnit.MILLISECONDS);
                         if (f != null) out.write(f);
+                        long now = System.currentTimeMillis();
+                        if (now - lastPing >= 5000) { out.write(PING); lastPing = now; }
                     }
                 } catch (Exception e) { /* fall through */ }
                 close();

@@ -18,6 +18,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Display;
@@ -48,6 +49,8 @@ public class StreamService extends Service {
     private boolean landscape;
     private long t0Us;
     private boolean stopping;
+    private PowerManager.WakeLock wakeLock;
+    private boolean owner; // this instance owns the static 'running' flag
 
     @Override public IBinder onBind(Intent intent) { return null; }
 
@@ -57,7 +60,7 @@ public class StreamService extends Service {
             stopSelf();
             return START_NOT_STICKY;
         }
-        if (intent == null || running) return START_NOT_STICKY;
+        if (intent == null) return START_NOT_STICKY;
 
         createChannel();
         // Android 14+: must be foreground with type mediaProjection BEFORE getMediaProjection().
@@ -68,6 +71,15 @@ public class StreamService extends Service {
             fgsType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
         }
         startForeground(1, buildNotification(), fgsType);
+        if (running) {
+            // Same live instance: ignore. New instance while the old one is still closing: bail out.
+            if (projection == null) {
+                lastError = "Önceki yayın kapanıyor, birkaç saniye sonra tekrar deneyin.";
+                notifyStatus();
+                stopSelf();
+            }
+            return START_NOT_STICKY;
+        }
 
         int code = intent.getIntExtra(EXTRA_CODE, 0);
         Intent data;
@@ -85,10 +97,17 @@ public class StreamService extends Service {
         handler = new Handler(thread.getLooper());
         // Android 14+: callback must be registered before createVirtualDisplay().
         projection.registerCallback(new MediaProjection.Callback() {
-            @Override public void onStop() { handler.post(StreamService.this::stopSelf); }
+            @Override public void onStop() {
+                // Android 15 QPR1+ ends screen sharing when the phone locks.
+                if (!stopping) lastError = "Paylaşım sistem tarafından durduruldu (telefon kilitlenmiş olabilir).";
+                handler.post(StreamService.this::stopSelf);
+            }
         }, handler);
 
+        // Keep the screen on (dimmed allowed) while streaming: a locked phone stops the share.
+        acquireScreenLock();
         running = true;
+        owner = true;
         lastError = null;
         notifyStatus();
         handler.post(this::startPipeline);
@@ -98,11 +117,12 @@ public class StreamService extends Service {
     private void startPipeline() {
         try {
             t0Us = System.nanoTime() / 1000;
-            server = new StreamServer(PORT, readAsset("index.html"), () -> {
+            final StreamServer srv = new StreamServer(PORT, readAsset("index.html"), () -> {
                 VideoEncoder v = video;
                 if (v != null) v.requestKeyFrame();
             });
-            server.start();
+            server = srv;
+            srv.start();
 
             startVideo();
 
@@ -110,8 +130,8 @@ public class StreamService extends Service {
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                 try {
                     audio = new AudioEncoder(projection, t0Us, new AudioEncoder.Sink() {
-                        @Override public void onAudioInit(byte[] init, String codec) { server.setAudioInit(init, codec); }
-                        @Override public void onAudioFragment(byte[] f) { server.sendAudio(f); }
+                        @Override public void onAudioInit(byte[] init, String codec) { srv.setAudioInit(init, codec); }
+                        @Override public void onAudioFragment(byte[] f) { srv.sendAudio(f); }
                     });
                     audio.start();
                     audioOk = true;
@@ -120,7 +140,7 @@ public class StreamService extends Service {
                     audio = null;
                 }
             }
-            if (!audioOk) server.setAudioExpected(false);
+            if (!audioOk) srv.setAudioExpected(false);
 
             DisplayManager dm = getSystemService(DisplayManager.class);
             displayListener = new DisplayManager.DisplayListener() {
@@ -154,9 +174,10 @@ public class StreamService extends Service {
     private void startVideo() throws Exception {
         Point s = screenSize();
         landscape = s.x > s.y;
+        final StreamServer srv = server;
         VideoEncoder v = VideoEncoder.create(s.x, s.y, t0Us, new VideoEncoder.Sink() {
-            @Override public void onVideoInit(byte[] init, String codec) { server.setVideoInit(init, codec); }
-            @Override public void onVideoFragment(byte[] f, boolean key) { server.sendVideo(f, key); }
+            @Override public void onVideoInit(byte[] init, String codec) { srv.setVideoInit(init, codec); }
+            @Override public void onVideoFragment(byte[] f, boolean key) { srv.sendVideo(f, key); }
         });
         if (display == null) {
             display = projection.createVirtualDisplay("TeslaMirror", v.width, v.height, densityDpi(),
@@ -192,22 +213,36 @@ public class StreamService extends Service {
         stopSelf();
     }
 
+    @SuppressWarnings("deprecation")
+    private void acquireScreenLock() {
+        try {
+            PowerManager pm = getSystemService(PowerManager.class);
+            wakeLock = pm.newWakeLock(PowerManager.SCREEN_DIM_WAKE_LOCK, "TeslaMirror:screen");
+            wakeLock.acquire(4 * 60 * 60 * 1000L); // safety cap: 4 h
+        } catch (Exception e) {
+            Log.w(TAG, "wake lock failed", e);
+        }
+    }
+
     @Override
     public void onDestroy() {
         stopping = true;
-        running = false;
+        try { if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); } catch (Exception ignored) {}
         if (handler != null) {
-            // Tear down on the pipeline thread, then quit it.
-            handler.post(this::teardown);
+            // Tear down on the pipeline thread, then quit it; 'running' stays true until done
+            // so a quick restart can't collide with the old server socket.
+            handler.post(() -> { teardown(); if (owner) running = false; notifyStatus(); });
             thread.quitSafely();
         } else {
             teardown();
+            if (owner) running = false;
+            notifyStatus();
         }
-        notifyStatus();
         super.onDestroy();
     }
 
     private void teardown() {
+        if (server != null) { server.stop(); server = null; } // free the port first
         try {
             if (displayListener != null) getSystemService(DisplayManager.class).unregisterDisplayListener(displayListener);
         } catch (Exception ignored) {}
@@ -217,7 +252,6 @@ public class StreamService extends Service {
         if (display != null) { display.setSurface(null); display.release(); display = null; }
         if (v != null) v.stop();
         if (projection != null) { try { projection.stop(); } catch (Exception ignored) {} projection = null; }
-        if (server != null) { server.stop(); server = null; }
     }
 
     private void notifyStatus() {

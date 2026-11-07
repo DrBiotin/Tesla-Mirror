@@ -14,6 +14,8 @@ import android.view.Gravity;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.view.WindowInsets;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -37,7 +39,7 @@ public class MainActivity extends Activity {
         root.setGravity(Gravity.CENTER_HORIZONTAL);
         root.setBackgroundColor(Color.rgb(18, 18, 18));
         int pad = dp(24);
-        root.setPadding(pad, dp(56), pad, pad);
+        root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
         title.setText("TeslaMirror");
@@ -67,7 +69,19 @@ public class MainActivity extends Activity {
         ip.topMargin = dp(24);
         root.addView(info, ip);
 
-        setContentView(root);
+        // targetSdk 35+ is edge-to-edge: pad by system bars/cutout and allow scrolling.
+        ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(Color.rgb(18, 18, 18));
+        scroll.setFillViewport(true);
+        scroll.addView(root);
+        scroll.setOnApplyWindowInsetsListener((view, insets) -> {
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets i = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                view.setPadding(i.left, i.top, i.right, i.bottom);
+            }
+            return insets;
+        });
+        setContentView(scroll);
     }
 
     @Override
@@ -103,7 +117,9 @@ public class MainActivity extends Activity {
              .append("2. Tesla'yı bu hotspot'a bağlayın (Kontroller > Wi-Fi).\n")
              .append("3. \"Yayını başlat\"a basın, \"Tüm ekran\"ı seçin.\n")
              .append("4. Görünen adresi Tesla tarayıcısında açıp ▶ Başlat'a dokunun.\n\n")
-             .append("Not: Netflix gibi korumalı (DRM) uygulamalar siyah ekran/sessiz görünür.");
+             .append("Notlar:\n• Yayın sırasında telefon ekranı açık tutulur; telefonu kilitlerseniz yayın durur.\n")
+             .append("• Netflix gibi korumalı (DRM) uygulamalar siyah ekran/sessiz görünür.\n")
+             .append("• Tesla sürüşte tarayıcı videosunu gizleyebilir; ses devam eder.");
         }
         info.setText(s.toString());
     }
